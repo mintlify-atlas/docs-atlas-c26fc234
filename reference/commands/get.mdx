@@ -1,0 +1,61 @@
+---
+title: "GET"
+description: "Get the value of a key"
+---
+
+Retrieve the string value stored at a key. Returns `(nil)` if the key does not exist or has expired.
+
+## Syntax
+
+```bash
+GET key
+```
+
+## Parameters
+
+<ParamField path="key" type="string" required>
+  The name of the key to look up.
+</ParamField>
+
+## Return value
+
+Returns the stored string value, or `(nil)` if the key is missing or has expired.
+
+## Errors
+
+| Condition | Error message |
+|---|---|
+| Wrong number of arguments | `(error) wrong number of arguments for 'GET'` |
+
+## Examples
+
+```bash
+>>> SET name radish
+OK
+>>> GET name
+radish
+
+>>> GET missing
+(nil)
+```
+
+Retrieving an expired key:
+
+```bash
+>>> SET temp hello EX 1
+OK
+
+# (after 1 second)
+>>> GET temp
+(nil)
+```
+
+## Notes
+
+<Note>
+  `GET` implements passive expiry. If the key exists in memory but its TTL has elapsed, the key is deleted inline and `(nil)` is returned — no explicit sweep is required.
+</Note>
+
+<Info>
+  `GET` never updates a key's TTL. Use [`SET`](/reference/commands/set) with `EX` to reset expiry.
+</Info>

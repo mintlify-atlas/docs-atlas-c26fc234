@@ -1,0 +1,157 @@
+---
+title: "Architecture"
+description: "How RadishDB separates the storage engine from protocol frontends"
+---
+
+RadishDB is built around a single design principle: **the engine knows nothing about I/O**. Command parsing, execution, and storage are handled by `engine.c` and its dependencies. How results reach a client — whether through a terminal or a TCP socket — is the concern of the frontend layer alone.
+
+This separation means the same command semantics power both the interactive REPL and the TCP server, with zero duplication of logic.
+
+## Module layout
+
+```
+┌─────────────────────────────────────────────┐
+│               Frontend layer                │
+│                                             │
+│   repl.c (REPL)      server.c (TCP :6379)   │
+│         │                    │              │
+│         └──────────┬─────────┘              │
+│                    │                        │
+│           execute_command()                 │
+└────────────────────┼────────────────────────┘
+                     │
+┌────────────────────▼────────────────────────┐
+│               Engine layer                  │
+│                                             │
+│   engine.c   → command parsing & dispatch   │
+│   hashtable.c → in-memory key-value store   │
+│   expires.c   → TTL tracking & sweeping     │
+│   aof.c       → write-ahead log (AOF)       │
+│   persistence.c → binary snapshots (.rdbx)  │
+└─────────────────────────────────────────────┘
+```
+
+The `main.c` startup routine initializes the hash table, opens and replays the AOF, and then hands control to whichever frontend was compiled in.
+
+## The protocol-agnostic engine
+
+`engine.c` exposes a single entry point:
+
+```c engine.c
+Result execute_command(HashTable *ht, char *line);
+```
+
+It receives a raw command string and a pointer to the hash table. It tokenizes the input, dispatches to the appropriate handler (`SET`, `GET`, `DEL`, `TTL`, etc.), and returns a `Result` struct. It never reads from or writes to any file descriptor. There is no `printf`, no `fgets`, no socket call anywhere in `engine.c`.
+
+This makes the engine trivially testable and reusable: any caller that can produce a string and consume a `Result` can drive it.
+
+## Result type system
+
+Commands communicate outcomes back to frontends through a tagged union:
+
+```c engine.h
+typedef enum {
+  RES_STRING,   // bulk string reply (e.g. GET value)
+  RES_OK,       // simple +OK reply
+  RES_ERROR,    // error message
+  RES_INTEGER,  // integer reply (e.g. TTL, DEL count)
+  RES_NIL,      // null reply (key not found)
+  RES_CLEAN,    // internal: no output needed
+  RES_EXIT      // signals the frontend to shut down
+} ResultType;
+
+typedef struct Result {
+  ResultType type;
+  union {
+    char *string;   // used for RES_STRING and RES_ERROR
+    long  integer;  // used for RES_INTEGER
+  } value;
+} Result;
+```
+
+Each frontend calls `print_result(fp, &r)` to serialize the result to its output stream — stdout for the REPL, the client socket for the TCP server. After printing, it calls `free_result(&r)` to release any heap-allocated string.
+
+<Note>
+  `RES_CLEAN` is returned by commands that have no user-visible output (for example, internal housekeeping). Frontends skip printing for this type.
+</Note>
+
+## Two frontends, one engine
+
+<Tabs>
+  <Tab title="REPL (repl.c)">
+    The REPL frontend reads lines from `stdin` and writes results to `stdout`. It displays a `>>> ` prompt before each command and runs the active expiry sweep on every iteration.
+
+    ```c repl.c
+    void repl_loop(HashTable *ht, size_t aof_size) {
+      while (1) {
+        expire_sweep(ht, 10);       // active expiry
+        printf(">>> "); fflush(stdout);
+        fgets(input, MAX_INPUT, stdin);
+        Result r = execute_command(ht, input);
+        print_result(stdout, &r);
+        free_result(&r);
+      }
+    }
+    ```
+
+    Use the REPL for local development, scripting, and exploration.
+  </Tab>
+  <Tab title="TCP server (server.c)">
+    The TCP server binds to `0.0.0.0:6379` and accepts one client at a time. It reads commands from the client file pointer and writes results back over the same connection.
+
+    ```c server.c
+    void start_server(HashTable *ht) {
+      // binds to 0.0.0.0:6379
+      while (fgets(input, MAX_INPUT, client_fp)) {
+        expire_sweep(ht, 10);
+        Result r = execute_command(ht, input);
+        print_result(client_fp, &r);
+        free_result(&r);
+      }
+    }
+    ```
+
+    Connect with `netcat`, `telnet`, or any raw TCP client. The protocol is newline-delimited plain text.
+  </Tab>
+</Tabs>
+
+Both frontends follow the identical pattern: sweep, read, execute, print, free.
+
+## Single-threaded design
+
+RadishDB is deliberately single-threaded. One goroutine — or rather, one OS thread — handles everything: the event loop, command execution, expiry sweeping, and I/O.
+
+<Columns cols={2}>
+  <Card title="Simplicity" icon="circle-check">
+    No mutexes, no lock ordering, no data races. The entire state of the database is owned by a single thread at all times.
+  </Card>
+  <Card title="Predictability" icon="chart-line">
+    Command latency is uniform. There is no contention-induced jitter from concurrent readers or writers.
+  </Card>
+  <Card title="Correctness" icon="shield-check">
+    The hash table, AOF, and expiry sweeper share state freely without synchronization primitives — and that is safe by design.
+  </Card>
+  <Card title="Auditability" icon="magnifying-glass">
+    The execution path for any command can be traced linearly through the source. There are no concurrency-related control flows to reason about.
+  </Card>
+</Columns>
+
+This is the same trade-off Redis made in its original design: accept that one thread processes one command at a time in exchange for a dramatically simpler implementation.
+
+## Uptime tracking
+
+The engine records its start time in `engine_start_time` at initialization. The `INFO` command subtracts the current time from this value to compute and report uptime in seconds. No external clock service or global state is required.
+
+## Intentional omissions
+
+The following are out of scope by design:
+
+- **No threads** — all state is single-owner, no synchronization
+- **No replication** — there is no leader/follower or primary/replica protocol
+- **No clustering** — data is not sharded or distributed
+- **No authentication** — the TCP server accepts all connections
+- **No pipelining** — commands are processed one at a time per connection
+
+<Note>
+  RadishDB is an educational database that implements real storage engine internals. For production multi-client workloads, consider Redis, KeyDB, or Dragonfly.
+</Note>

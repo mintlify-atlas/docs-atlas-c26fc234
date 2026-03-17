@@ -1,0 +1,209 @@
+---
+title: "Engine API"
+description: "C API reference for the RadishDB command execution engine"
+---
+
+The `engine` module parses and executes RadishDB commands against a `HashTable`. It is the layer between the REPL/server and the storage layer — all user-facing commands (`SET`, `GET`, `DEL`, `TTL`, `INFO`, `SAVE`, `LOAD`, `BENCH`, etc.) are dispatched here.
+
+## Data structures
+
+### `ResultType`
+
+Disciminant tag for the `Result` union.
+
+```c
+typedef enum {
+  RES_STRING,
+  RES_OK,
+  RES_ERROR,
+  RES_INTEGER,
+  RES_NIL,
+  RES_CLEAN,
+  RES_EXIT
+} ResultType;
+```
+
+| Variant | Meaning |
+|---|---|
+| `RES_STRING` | A heap-allocated string payload is present in `result.value.string`. |
+| `RES_OK` | The command succeeded with no value to return (e.g. `SET`). No payload. |
+| `RES_ERROR` | A heap-allocated error message is present in `result.value.string`. |
+| `RES_INTEGER` | A `long` result is present in `result.value.integer` (e.g. `TTL`, `DEL`, `COUNT`). |
+| `RES_NIL` | The command returned a null result (e.g. `GET` on a missing key). No payload. |
+| `RES_CLEAN` | Signals the REPL to clear the terminal screen. No payload. |
+| `RES_EXIT` | Signals the REPL or server to shut down cleanly. No payload. |
+
+---
+
+### `Result`
+
+The return value of `execute_command`. Carries both the result type and, for some variants, a payload.
+
+```c
+typedef struct Result {
+  ResultType type;
+  union {
+    char *string;  // used for RES_STRING and RES_ERROR — heap-allocated, must be freed
+    long integer;  // used for RES_INTEGER
+  } value;
+} Result;
+```
+
+<ResponseField name="type" type="ResultType" required>
+  Discriminant tag. Determines which field of `value` is valid.
+</ResponseField>
+
+<ResponseField name="value" type="union">
+  <Expandable title="properties">
+    <ResponseField name="value.string" type="char *">
+      Set when `type` is `RES_STRING` or `RES_ERROR`. Heap-allocated via `strdup` — you must free it by calling `free_result`.
+    </ResponseField>
+    <ResponseField name="value.integer" type="long">
+      Set when `type` is `RES_INTEGER`. No dynamic allocation; no cleanup needed.
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+<Warning>
+  Always call `free_result` after you are done with a `Result`. Skipping it for `RES_STRING` or `RES_ERROR` results is a memory leak.
+</Warning>
+
+---
+
+### `engine_start_time`
+
+```c
+extern time_t engine_start_time;
+```
+
+A module-level variable set once at process startup. The `INFO` command reads this to compute uptime. Set it before calling `execute_command` for the first time:
+
+```c
+engine_start_time = time(NULL);
+```
+
+---
+
+## Functions
+
+### `execute_command`
+
+Parses and executes a single RadishDB command string.
+
+```c
+Result execute_command(HashTable *ht, char *line);
+```
+
+<ParamField path="ht" type="HashTable *" required>
+  The hash table the command operates on.
+</ParamField>
+
+<ParamField path="line" type="char *" required>
+  A mutable, null-terminated command string such as `"SET name radish"`. The function modifies this buffer in-place: it calls `trim_newline` to strip trailing whitespace and `strtok` (via `split_tokens`) to tokenize it. Do not pass a string literal.
+</ParamField>
+
+**Returns** a `Result` struct. The caller must call `free_result` on it after use.
+
+<Warning>
+  `line` is modified in-place. Always pass a writable buffer, never a string literal. Declare with `char cmd[] = "..."` or `strdup` a literal before passing.
+</Warning>
+
+#### Handling each result type
+
+```c
+Result r = execute_command(ht, line);
+
+switch (r.type) {
+    case RES_OK:
+        printf("OK\n");
+        break;
+    case RES_STRING:
+        printf("%s\n", r.value.string);
+        break;
+    case RES_INTEGER:
+        printf("(integer) %ld\n", r.value.integer);
+        break;
+    case RES_NIL:
+        printf("(nil)\n");
+        break;
+    case RES_ERROR:
+        fprintf(stderr, "%s\n", r.value.string);
+        break;
+    case RES_EXIT:
+        // signal shutdown
+        break;
+    case RES_CLEAN:
+        // clear terminal
+        break;
+}
+
+free_result(&r);
+```
+
+---
+
+### `free_result`
+
+Frees the heap-allocated payload of a `Result`, if any.
+
+```c
+void free_result(Result *r);
+```
+
+<ParamField path="r" type="Result *" required>
+  Pointer to the result to free. For `RES_STRING` and `RES_ERROR`, frees `r->value.string`. For all other types, this is a no-op.
+</ParamField>
+
+The implementation:
+
+```c
+void free_result(Result *r) {
+    if ((r->type == RES_STRING || r->type == RES_ERROR) && r->value.string) {
+        free(r->value.string);
+    }
+}
+```
+
+<Note>
+  It is safe to call `free_result` on any result type — it only frees memory when a payload is present.
+</Note>
+
+---
+
+## Full example
+
+```c
+#include "engine.h"
+#include "hashtable.h"
+#include <stdio.h>
+#include <time.h>
+
+int main(void) {
+    HashTable *ht = ht_create(8);
+    engine_start_time = time(NULL);
+
+    // SET
+    char cmd1[] = "SET name radish";
+    Result r1 = execute_command(ht, cmd1);
+    // r1.type == RES_OK
+    free_result(&r1);
+
+    // GET
+    char cmd2[] = "GET name";
+    Result r2 = execute_command(ht, cmd2);
+    if (r2.type == RES_STRING) {
+        printf("Value: %s\n", r2.value.string);  // "radish"
+    }
+    free_result(&r2);
+
+    // TTL (no expiry set → -1)
+    char cmd3[] = "TTL name";
+    Result r3 = execute_command(ht, cmd3);
+    // r3.type == RES_INTEGER, r3.value.integer == -1
+    printf("TTL: %ld\n", r3.value.integer);
+    free_result(&r3);
+
+    ht_free(ht);
+    return 0;
+}
+```

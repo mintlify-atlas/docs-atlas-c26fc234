@@ -1,0 +1,229 @@
+---
+title: "AOF API"
+description: "C API reference for RadishDB's append-only file write-ahead log"
+---
+
+The `aof` module implements RadishDB's append-only file (AOF) write-ahead log. Every mutation (`SET`, `DEL`) is appended as a structured record to a file on disk. On restart, `aof_replay` re-applies those records to restore state. `aof_rewrite` compacts the log by rewriting only the live entries.
+
+<Note>
+  The AOF module keeps a single module-level file handle. Only one AOF file can be open at a time.
+</Note>
+
+## Utility functions
+
+### `trim_newline`
+
+Strips a trailing newline or carriage-return from a string in-place.
+
+```c
+void trim_newline(char *s);
+```
+
+<ParamField path="s" type="char *" required>
+  Mutable null-terminated string. Modified in-place.
+</ParamField>
+
+This is used internally by `aof_replay` to clean up lines read from the AOF file. You will rarely need to call it directly.
+
+---
+
+### `split_tokens`
+
+Tokenizes a whitespace-delimited command line into an argument vector.
+
+```c
+int split_tokens(char *line, char *argv[], int max);
+```
+
+<ParamField path="line" type="char *" required>
+  Mutable null-terminated command string. Modified in-place by `strtok`.
+</ParamField>
+
+<ParamField path="argv" type="char *[]" required>
+  Output array of token pointers. Each element points into `line` after tokenization.
+</ParamField>
+
+<ParamField path="max" type="int" required>
+  Maximum number of tokens to extract.
+</ParamField>
+
+**Returns** the number of tokens found.
+
+Used internally by `aof_replay` to parse each AOF record line. Also shared with `execute_command` in `engine.c`.
+
+---
+
+## Core functions
+
+### `aof_open`
+
+Opens the AOF file for append-and-read access, creating it if it does not exist.
+
+```c
+int aof_open(const char *filename);
+```
+
+<ParamField path="filename" type="const char *" required>
+  Path to the AOF file, e.g. `"aof/radish.aof"`. Opened in `"ab+"` mode.
+</ParamField>
+
+**Returns** `1` on success, `0` if `fopen` fails.
+
+Sets the module-level `aof_file` pointer used by all subsequent `aof_append_*` and `aof_rewrite` calls.
+
+```c
+if (!aof_open("aof/radish.aof")) {
+    fprintf(stderr, "Failed to open AOF\n");
+    exit(1);
+}
+```
+
+---
+
+### `aof_close`
+
+Flushes and closes the AOF file.
+
+```c
+void aof_close(void);
+```
+
+Call this during a clean shutdown. If no file is open, this is a no-op.
+
+```c
+aof_close();
+```
+
+---
+
+### `aof_append_set`
+
+Appends a `SET` record to the AOF.
+
+```c
+void aof_append_set(const char *key, const char *value, const char *expire_at);
+```
+
+<ParamField path="key" type="const char *" required>
+  The key being set.
+</ParamField>
+
+<ParamField path="value" type="const char *" required>
+  The value being stored.
+</ParamField>
+
+<ParamField path="expire_at" type="const char *" required>
+  TTL string in seconds (e.g. `"30"`), or `NULL` for no expiry. In C, passing integer `0` is equivalent to `NULL` and is treated as no expiry.
+</ParamField>
+
+<Warning>
+  `aof_open` must be called before any `aof_append_*` call. Writing to a closed file handle is undefined behavior.
+</Warning>
+
+```c
+aof_append_set("name",  "radish", NULL);  // no TTL
+aof_append_set("color", "red",    "30"); // expires in 30 seconds
+```
+
+---
+
+### `aof_append_del`
+
+Appends a `DEL` record to the AOF.
+
+```c
+void aof_append_del(const char *key);
+```
+
+<ParamField path="key" type="const char *" required>
+  The key being deleted.
+</ParamField>
+
+```c
+aof_append_del("name");
+```
+
+---
+
+### `aof_replay`
+
+Replays an AOF file into a hash table, restoring all `SET` and `DEL` operations.
+
+```c
+int aof_replay(HashTable *h, const char *filename);
+```
+
+<ParamField path="h" type="HashTable *" required>
+  The hash table to replay mutations into.
+</ParamField>
+
+<ParamField path="filename" type="const char *" required>
+  Path to the AOF file to replay.
+</ParamField>
+
+**Returns** `1` always. A missing file is not treated as an error (it is expected on first run).
+
+#### Replay behavior
+
+- Reads and validates the `AOFX1` header if present; skips it if the file starts without a header (legacy format).
+- Applies `SET` records by calling `ht_set` with the stored key, value, and expiry.
+- Applies `DEL` records by calling `ht_delete`.
+- Stops on any corrupt or unrecognized frame.
+
+```c
+aof_open("aof/radish.aof");
+aof_replay(ht, "aof/radish.aof");
+```
+
+---
+
+### `aof_rewrite`
+
+Compacts the AOF by rewriting only the current live entries from the hash table.
+
+```c
+void aof_rewrite(HashTable *ht, const char *filename);
+```
+
+<ParamField path="ht" type="HashTable *" required>
+  The hash table whose live entries will be written.
+</ParamField>
+
+<ParamField path="filename" type="const char *" required>
+  Target AOF filename. The rewrite writes to `<filename>.tmp`, then atomically renames it to `filename`.
+</ParamField>
+
+#### Rewrite sequence
+
+1. Writes all live `SET` entries (with their current `expires_at`) to `aof/radish.aof.tmp`.
+2. Renames the temporary file to `filename` (atomic on POSIX systems).
+3. Reopens `aof_file` in `"ab"` mode pointing to the new file.
+
+<Warning>
+  `aof_open` must have been called before `aof_rewrite`. The function uses the module-level `aof_file` pointer internally.
+</Warning>
+
+```c
+aof_rewrite(ht, "aof/radish.aof");
+```
+
+---
+
+## Typical usage sequence
+
+```c
+// Startup: open and replay
+aof_open("aof/radish.aof");
+aof_replay(ht, "aof/radish.aof");
+
+// On each mutation
+aof_append_set("name",  "radish", NULL);   // no TTL
+aof_append_set("color", "red",    "30");   // 30-second TTL
+aof_append_del("name");
+
+// Compaction (e.g. triggered by BGREWRITE command)
+aof_rewrite(ht, "aof/radish.aof");
+
+// Shutdown
+aof_close();
+```

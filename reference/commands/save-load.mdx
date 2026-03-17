@@ -1,0 +1,85 @@
+---
+title: "SAVE and LOAD"
+description: "Save and restore the full database state using binary .rdbx snapshots"
+---
+
+Persist the entire in-memory database to disk with `SAVE`, and restore it from a snapshot file with `LOAD`. Snapshots use the binary `.rdbx` format.
+
+## Syntax
+
+```bash
+SAVE filename
+LOAD filename
+```
+
+## Parameters
+
+<ParamField path="filename" type="string" required>
+  Path to the snapshot file. If the filename does not end with `.rdbx`, the extension is appended automatically.
+</ParamField>
+
+## Return value
+
+Both commands return `OK` on success.
+
+## Errors
+
+| Command | Condition | Error message |
+|---|---|---|
+| `SAVE` | Could not write to disk | `(error) could not write file` |
+| `LOAD` | File not found | `(error) could not open file` |
+| `LOAD` | File is corrupt or not RDBX format | `(error) invalid RDBX file` |
+| Either | Wrong number of arguments | `(error) wrong number of arguments for 'SAVE'` / `'LOAD'` |
+
+## Examples
+
+Save the current database state and restore it after modifications:
+
+```bash
+>>> SET name radish
+OK
+>>> SET color red EX 100
+OK
+>>> SAVE backup
+OK
+
+>>> DEL name
+(integer) 1
+>>> GET name
+(nil)
+
+>>> LOAD backup
+OK
+>>> GET name
+radish
+```
+
+The `.rdbx` extension is added automatically:
+
+```bash
+>>> SAVE mydata
+OK
+# Writes to: mydata.rdbx
+
+>>> LOAD mydata.rdbx
+OK
+# .rdbx extension is accepted as-is
+```
+
+## Notes
+
+<Warning>
+  `LOAD` replaces the entire in-memory database. All current keys are discarded before the snapshot is applied. There is no merge — the loaded snapshot becomes the new database state.
+</Warning>
+
+<Info>
+  After `LOAD`, the expiry sweeper is re-initialized (`expire_init`) so that TTL-based background expiry resumes correctly for keys restored from the snapshot.
+</Info>
+
+<Note>
+  Snapshots complement the append-only file (AOF) but do not replace it. After `LOAD`, the AOF continues to record all subsequent mutations. Consider taking a snapshot before destructive operations as an additional recovery point.
+</Note>
+
+<Tip>
+  Use `SAVE` before `LOAD` to create a recovery point if the snapshot file might not be what you expect.
+</Tip>

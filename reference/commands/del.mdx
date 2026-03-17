@@ -1,0 +1,66 @@
+---
+title: "DEL"
+description: "Delete a key from the database"
+---
+
+Remove a key and its associated value from the database. Works on keys with or without a TTL.
+
+## Syntax
+
+```bash
+DEL key
+```
+
+## Parameters
+
+<ParamField path="key" type="string" required>
+  The name of the key to delete.
+</ParamField>
+
+## Return value
+
+Returns `(integer) 1` if the key was found and deleted, or `(nil)` if the key did not exist.
+
+## Errors
+
+| Condition | Error message |
+|---|---|
+| Wrong number of arguments | `(error) wrong number of arguments for 'DEL'` |
+
+## Examples
+
+```bash
+>>> SET name radish
+OK
+>>> DEL name
+(integer) 1
+
+>>> DEL name
+(nil)
+
+>>> DEL nonexistent
+(nil)
+```
+
+Deleting a key that has a TTL:
+
+```bash
+>>> SET session abc123 EX 3600
+OK
+>>> TTL session
+(integer) 3598
+>>> DEL session
+(integer) 1
+>>> TTL session
+(integer) -2
+```
+
+## Notes
+
+<Info>
+  Deletion is immediately appended to the AOF, so the removal is persisted before the command returns.
+</Info>
+
+<Note>
+  `DEL` only accepts a single key. To delete multiple keys, issue one `DEL` command per key.
+</Note>

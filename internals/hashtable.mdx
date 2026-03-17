@@ -1,0 +1,261 @@
+---
+title: "Hash table internals"
+description: "Deep dive into RadishDB's hash table implementation with separate chaining"
+---
+
+RadishDB stores all key-value pairs in a dynamically-sized hash table implemented from scratch in `hashtable.c`. It uses **separate chaining** for collision resolution and **lazy expiry** to clean up TTL keys without a background thread.
+
+## Data structures
+
+Two structs carry the entire in-memory state of the database.
+
+### Entry
+
+```c hashtable.h
+typedef struct Entry {
+  char *key;
+  char *value;
+  time_t expires_at;  // 0 = no expiry
+  struct Entry *next;
+} Entry;
+```
+
+Each entry owns heap-allocated copies of its key and value (via `strdup`). The `next` pointer forms the collision chain within a bucket. `expires_at` stores an absolute Unix timestamp; a value of `0` means the key never expires.
+
+### HashTable
+
+```c hashtable.h
+typedef struct HashTable {
+  Entry **buckets;
+  size_t size;
+  int count;
+  int resizes;
+} HashTable;
+```
+
+| Field | Description |
+|-------|-------------|
+| `buckets` | Heap-allocated array of `Entry *` pointers, one per slot |
+| `size` | Current number of buckets (always grows by 2×) |
+| `count` | Number of live keys currently stored |
+| `resizes` | Cumulative count of resize operations, exposed by `INFO` |
+
+## djb2 hash function
+
+All keys are hashed using **djb2**, a non-cryptographic hash function developed by Daniel Bernstein:
+
+```c hashtable.c
+unsigned long hash(const char *str) {
+  unsigned long hash = 5381;
+  for (int i = 0; str[i] != '\0'; i++) {
+    hash = hash * 33 + str[i];
+  }
+  return hash;
+}
+```
+
+The magic constants — seed `5381` and multiplier `33` — were chosen empirically. Multiplying by 33 (`hash << 5 + hash`) distributes bits widely across the output without expensive division. The seed 5381 is an odd prime that avoids clustering at zero for short keys. djb2 is not collision-resistant but has excellent avalanche behaviour for short ASCII strings, which is the dominant key type in a cache workload.
+
+The bucket index is computed as `hash(key) % ht->size`. Because `size` is always a power of two after the first resize, this modulo can be computed with a bitwise AND in practice, though the current code uses `%` for readability.
+
+## Separate chaining
+
+When two keys hash to the same bucket index, they coexist in a **linked list** hanging off that bucket slot. New entries are prepended (O(1)) rather than appended.
+
+```
+buckets array
+  [0] → NULL
+  [1] → ["host" | "localhost" | t=0] → NULL
+  [2] → ["port" | "6379"      | t=0] → ["mode" | "tcp" | t=0] → NULL
+  [3] → NULL
+  [4] → ["debug" | "off"      | t=0] → NULL
+  ...
+```
+
+Lookups walk the chain with `strcmp` until they find a matching key or exhaust the list. Chain length is bounded by the load factor: RadishDB resizes at 0.75, keeping average chain length below 1.
+
+## ht_set: writing a key
+
+`ht_set` handles both inserts and in-place updates.
+
+<Steps>
+  <Step title="Check load factor">
+    Before every write, the load factor (`count / size`) is computed. If it exceeds `0.75`, `ht_resize` is called to double the table before the write proceeds.
+
+    ```c hashtable.c
+    float load = (float)ht->count / ht->size;
+    if (load > 0.75f) ht_resize(ht, ht->size * 2);
+    ```
+  </Step>
+  <Step title="Compute bucket index">
+    The key is hashed and mapped to a bucket index.
+
+    ```c hashtable.c
+    unsigned long h = hash(key);
+    int index = h % ht->size;
+    ```
+  </Step>
+  <Step title="Walk the chain for an existing key">
+    The code walks the linked list at that bucket. If a matching key is found, it frees the old value, assigns the new one, and updates `expires_at`. No `count` increment occurs on an update.
+
+    ```c hashtable.c
+    Entry *entry = ht->buckets[index];
+    while (entry != NULL) {
+      if (strcmp(entry->key, key) == 0) {
+        free(entry->value);
+        entry->value = strdup(value);
+        entry->expires_at = expires_at;
+        return;
+      }
+      entry = entry->next;
+    }
+    ```
+  </Step>
+  <Step title="Prepend a new entry">
+    If no existing key matched, a new `Entry` is allocated, its key and value are `strdup`-ed, and it is prepended to the bucket chain. `count` is incremented.
+
+    ```c hashtable.c
+    Entry *new_entry = malloc(sizeof(Entry));
+    new_entry->key = strdup(key);
+    new_entry->value = strdup(value);
+    new_entry->expires_at = expires_at;
+    new_entry->next = ht->buckets[index];
+    ht->buckets[index] = new_entry;
+    ht->count++;
+    ```
+  </Step>
+</Steps>
+
+## ht_get: passive expiry
+
+`ht_get` embeds expiry logic directly in the read path. No separate background thread is needed.
+
+```c hashtable.c
+char *ht_get(HashTable *ht, const char *key) {
+  unsigned long h = hash(key);
+  int index = h % ht->size;
+  time_t cur_time = time(NULL);
+  Entry *entry = ht->buckets[index];
+  while (entry != NULL) {
+    if (strcmp(entry->key, key) == 0) {
+      if (cur_time >= entry->expires_at && entry->expires_at != 0) {
+        ht_delete(ht, key);
+        return NULL;
+      }
+      return entry->value;
+    }
+    entry = entry->next;
+  }
+  return NULL;
+}
+```
+
+When a matching key is found:
+
+- If `expires_at` is non-zero **and** the current time is at or past `expires_at`, the entry is deleted immediately and `NULL` is returned — the key appears to never have existed.
+- Otherwise the value pointer is returned directly. The caller must **not** free this pointer; it is owned by the entry.
+
+<Note>
+  Passive expiry only fires when the key is accessed. Keys that are set with a TTL and then never read again remain in memory until the active sweeper (`expire_sweep`) removes them. See [TTL expiration](/concepts/ttl-expiration) for the full sweep algorithm.
+</Note>
+
+## ht_delete: unlinking an entry
+
+`ht_delete` must handle two cases depending on where in the chain the target entry sits.
+
+```
+Case 1 — head of chain:
+  bucket[i] → [target] → [next] → NULL
+  After: bucket[i] → [next] → NULL
+
+Case 2 — mid-chain:
+  bucket[i] → [prev] → [target] → [next] → NULL
+  After: bucket[i] → [prev] → [next] → NULL
+```
+
+In both cases, `free(entry->key)`, `free(entry->value)`, and `free(entry)` are called. `ht->count` is decremented. The function returns `1` on success and `0` if the key was not found.
+
+## ht_resize: rehashing
+
+`ht_resize` allocates a fresh bucket array and rehashes every live entry into it. Crucially, it **reuses the existing `Entry` nodes** — it does not `malloc` new entries, only `malloc` the new bucket array.
+
+```c hashtable.c
+void ht_resize(HashTable *ht, int new_size) {
+  Entry **new_buckets = malloc(new_size * sizeof(Entry *));
+  for (int i = 0; i < new_size; i++) new_buckets[i] = NULL;
+
+  for (size_t i = 0; i < ht->size; i++) {
+    Entry *entry = ht->buckets[i];
+    while (entry) {
+      Entry *next = entry->next;          // save next before relinking
+      unsigned long h = hash(entry->key);
+      int index = h % new_size;
+      entry->next = new_buckets[index];   // prepend to new chain
+      new_buckets[index] = entry;
+      entry = next;
+    }
+  }
+
+  free(ht->buckets);
+  ht->buckets = new_buckets;
+  ht->size = new_size;
+  ht->resizes++;
+}
+```
+
+The loop saves `entry->next` before relinking because `entry->next` is overwritten during the prepend. After the loop, the old bucket array is freed. `ht->resizes` is incremented for telemetry.
+
+<Warning>
+  Resize is triggered synchronously inside `ht_set`. For workloads that insert a large batch of keys at once, expect a brief latency spike when the table crosses the 0.75 threshold. There is no incremental rehashing.
+</Warning>
+
+## Memory model
+
+RadishDB applies a strict ownership rule: **the hash table owns all strings**.
+
+| Operation | Memory action |
+|-----------|---------------|
+| `ht_set` (new key) | `strdup(key)` + `strdup(value)` |
+| `ht_set` (update) | `free(old_value)` + `strdup(new_value)`; key is unchanged |
+| `ht_get` | Returns a raw pointer into the entry — do not free |
+| `ht_delete` | `free(key)` + `free(value)` + `free(entry)` |
+| `ht_resize` | Reuses `Entry` nodes; frees old bucket array only |
+| `ht_free` | Walks all chains, frees every entry, frees bucket array, frees `ht` |
+
+No string is shared between callers. Every `strdup` is paired with exactly one `free`.
+
+## ht_info: introspection
+
+`ht_info` returns a snapshot of hash table statistics without modifying state:
+
+```c hashtable.h
+typedef struct Info {
+  int keys;           // total live keys
+  int keys_with_ttl;  // keys that have a non-zero expires_at
+  int expired_keys;   // keys past their expires_at (not yet swept)
+  int buckets;        // current ht->size
+  float load_factor;  // (float)count / size
+  int max_chain;      // length of the longest chain
+  int resizes;        // cumulative resize count
+} Info;
+```
+
+The implementation walks every bucket and every chain, computing `expired_keys` by comparing `entry->expires_at` against `time(NULL)`. `max_chain` is updated for each bucket by counting chain length inline. The `INFO` command calls `ht_info` and formats the result for display.
+
+## Performance characteristics
+
+| Operation | Average case | Worst case |
+|-----------|-------------|------------|
+| `ht_get` | O(1) | O(n) — all keys in one bucket |
+| `ht_set` (update) | O(1) | O(n) |
+| `ht_set` (insert, no resize) | O(1) amortized | O(n) |
+| `ht_set` (insert, triggers resize) | O(n) | O(n) |
+| `ht_delete` | O(1) | O(n) |
+| `ht_resize` | O(n) | O(n) |
+| `ht_info` | O(n) | O(n) |
+
+With a load factor capped at 0.75, the expected chain length at any bucket is less than 1, making the average-case cost of get, set, and delete effectively constant.
+
+<Tip>
+  The `INFO` command prints `load_factor`, `max_chain`, and `resizes` at runtime. Watch `max_chain` — a value significantly above 3 suggests a hash collision attack or a pathological key pattern.
+</Tip>

@@ -1,0 +1,53 @@
+---
+title: "COUNT"
+description: "Return the number of keys currently in the database"
+---
+
+Return the total number of live keys in the database. This reads directly from the internal hash table counter.
+
+## Syntax
+
+```bash
+COUNT
+```
+
+## Parameters
+
+None.
+
+## Return value
+
+Returns `(integer) N`, where N is the number of keys currently tracked by the hash table.
+
+## Examples
+
+```bash
+>>> SET a 1
+OK
+>>> SET b 2
+OK
+>>> COUNT
+(integer) 2
+
+>>> DEL a
+(integer) 1
+>>> COUNT
+(integer) 1
+```
+
+```bash
+>>> BENCH 5
+Inserted 5 entries in 0.00 seconds.
+>>> COUNT
+(integer) 5
+```
+
+## Notes
+
+<Note>
+  `COUNT` reflects `ht->count`, the internal key counter. This counter is decremented immediately on [`DEL`](/reference/commands/del) and on passive expiry (when [`GET`](/reference/commands/get) or [`TTL`](/reference/commands/ttl) detects an expired key).
+</Note>
+
+<Warning>
+  `COUNT` does not trigger an active expiry sweep. Keys that have passed their TTL but have not yet been accessed may still be included in the count. The reported value can be slightly higher than the number of keys that are actually retrievable.
+</Warning>

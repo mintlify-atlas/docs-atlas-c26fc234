@@ -1,0 +1,143 @@
+---
+title: "Docker Compose"
+description: "Orchestrate RadishDB with Docker Compose"
+---
+
+Docker Compose is the recommended way to run RadishDB in a persistent, automatically-restarting configuration. It manages the container, port binding, and named volume in a single declarative file.
+
+## Setup
+
+<Steps>
+  <Step title="Create your compose file">
+    Save the following as `docker-compose.yml` in your project directory:
+
+    ```yaml
+    version: "3.8"
+
+    services:
+      radishdb:
+        image: piee314/radishdb:latest
+        container_name: radishdb
+        ports:
+          - "6379:6379"
+        volumes:
+          - radish-data:/app/aof
+        restart: unless-stopped
+
+    volumes:
+      radish-data:
+    ```
+
+    Field reference:
+
+    | Field | Value | Purpose |
+    |---|---|---|
+    | `image` | `piee314/radishdb:latest` | Official RadishDB image from Docker Hub |
+    | `container_name` | `radishdb` | Stable name for `docker` CLI commands |
+    | `ports` | `"6379:6379"` | Expose the TCP server on the host |
+    | `volumes` | `radish-data:/app/aof` | Persist AOF data across restarts |
+    | `restart` | `unless-stopped` | Restart on crash or host reboot, stop only on explicit `docker stop` |
+
+    <Tip>
+      `restart: unless-stopped` means RadishDB comes back automatically after a host reboot or unexpected crash, but stays stopped if you deliberately ran `docker compose stop` or `docker stop radishdb`. This is the right policy for a stateful service.
+    </Tip>
+  </Step>
+
+  <Step title="Start RadishDB">
+    Pull the image and start the container in detached mode:
+
+    ```bash
+    docker compose up -d
+    ```
+
+    Docker Compose creates the `radish-data` named volume automatically if it does not already exist.
+  </Step>
+
+  <Step title="Verify it is running">
+    Check container status:
+
+    ```bash
+    docker compose ps
+    ```
+
+    Expected output:
+
+    ```
+    NAME        IMAGE                       COMMAND      SERVICE     CREATED        STATUS        PORTS
+    radishdb    piee314/radishdb:latest     "./radishdb --server"   radishdb    5 seconds ago   Up 4 seconds   0.0.0.0:6379->6379/tcp
+    ```
+
+    Send a test command:
+
+    ```bash
+    echo "SET hello world" | nc localhost 6379
+    ```
+  </Step>
+</Steps>
+
+## Common commands
+
+Start all services defined in `docker-compose.yml`:
+
+```bash
+docker compose up -d
+```
+
+Stop and remove containers (volumes are preserved):
+
+```bash
+docker compose down
+```
+
+Stop, remove containers, **and** delete named volumes:
+
+```bash
+docker compose down -v
+```
+
+Stream live logs:
+
+```bash
+docker compose logs -f
+```
+
+Check container status:
+
+```bash
+docker compose ps
+```
+
+Restart the service (triggers AOF replay on startup):
+
+```bash
+docker compose restart radishdb
+```
+
+## Persistent volume
+
+The `radish-data` volume maps to `/app/aof` inside the container. RadishDB writes every mutation to `/app/aof/radish.aof` before applying it in memory. On restart, the engine replays this file to restore the full key-value state.
+
+Because the volume is declared at the top level of `docker-compose.yml`, it is not removed by `docker compose down`. You must explicitly pass `-v` to delete it.
+
+To inspect where Docker stores the volume on the host:
+
+```bash
+docker volume inspect radish-data
+```
+
+To back up the AOF file:
+
+```bash
+docker compose exec radishdb cat /app/aof/radish.aof > radish-backup.aof
+```
+
+## Updating to a new release
+
+Pull the latest image and recreate the container:
+
+```bash
+docker compose pull
+docker compose up -d
+```
+
+Docker Compose replaces the container with a new one using the updated image while keeping the `radish-data` volume intact. Your data is not affected.

@@ -1,0 +1,139 @@
+---
+title: "Crash recovery"
+description: "How RadishDB survives crashes and restores state on startup"
+---
+
+RadishDB uses the AOF (append-only file) as a write-ahead log. Every mutation is written to disk and `fsync`'d before `execute_command` returns. If the process crashes at any point — power loss, OOM kill, segfault — the AOF contains a complete and durable record of every command that completed successfully.
+
+On the next startup, RadishDB replays the AOF to reconstruct the exact in-memory state that existed before the crash.
+
+## How durability is guaranteed
+
+The key guarantee is that every write is flushed at two levels before the caller sees a response:
+
+<Steps>
+  <Step title="Write to the kernel buffer">
+    `fwrite` copies the data from the application's buffer into the kernel's page cache. At this point the data is in memory but not necessarily on disk.
+  </Step>
+  <Step title="Flush to disk with fsync">
+    `fsync(fileno(aof_file))` blocks until the kernel confirms the data has been written to the physical storage device. This is the durability barrier.
+
+    ```c aof.c
+    fwrite(&length, sizeof(uint32_t), 1, aof_file);
+    fwrite(buffer,  length,           1, aof_file);
+    fflush(aof_file);
+    fsync(fileno(aof_file));  // guaranteed on disk before returning
+    ```
+  </Step>
+  <Step title="Return result to the frontend">
+    Only after `fsync` returns does `execute_command` return the `Result` to the frontend, which then sends the reply to the client. If the process crashes after `fsync` but before the reply is sent, the command is still durable — the client just won't receive the acknowledgement and should retry.
+  </Step>
+</Steps>
+
+<Warning>
+  `fsync` on every write is the safest durability mode but also the most I/O-intensive. RadishDB prioritizes correctness over write throughput.
+</Warning>
+
+## Startup recovery sequence
+
+When RadishDB starts, it recovers state before accepting any commands:
+
+<Steps>
+  <Step title="Open the AOF">
+    The AOF is opened in append+read mode (`"ab+"`). If the file does not exist, it is created.
+
+    ```c main.c
+    aof_open("aof/radish.aof");
+    ```
+  </Step>
+  <Step title="Replay all entries">
+    `aof_replay` reads every length-prefixed entry from the beginning of the file and passes each command string to `execute_command`. The hash table is rebuilt from scratch as if you had typed every command yourself.
+
+    ```c main.c
+    aof_replay(ht, "aof/radish.aof");
+    ```
+  </Step>
+  <Step title="Reset the expiry cursor">
+    After replay, `expire_init` resets the active expiry cursor to the beginning of the table so the sweeper starts from a consistent position.
+
+    ```c main.c
+    expire_init(ht);
+    ```
+  </Step>
+  <Step title="Compact the AOF if needed">
+    If the AOF has grown to more than twice its post-rewrite base size, RadishDB rewrites it immediately before accepting commands. This removes all historical redundancy accumulated since the last rewrite.
+
+    ```c main.c
+    size_t aof_base_size = aof_header_filesize("aof/radish.aof");
+    size_t aof_size      = aof_filesize("aof/radish.aof");
+
+    if (aof_size > aof_base_size * 2 || aof_base_size == 0) {
+      aof_rewrite(ht, "aof/radish.aof");
+    }
+    ```
+  </Step>
+  <Step title="Start accepting commands">
+    The REPL loop or TCP server starts. The database is now in the same state it was in when it last shut down (or crashed).
+  </Step>
+</Steps>
+
+## Partial write protection
+
+A crash can occur mid-write, leaving a partial record at the end of the AOF. The length-prefix framing detects this:
+
+```
+┌────────────┬──────────────────┐
+│ length: 12 │ "SET foo bar\n"  │  ← complete record
+├────────────┼──────────────────┤
+│ length: 9  │ "DEL fo"         │  ← partial write (only 6 bytes of 9)
+└────────────┴──────────────────┘
+                                    ↑ replay stops here
+```
+
+During replay, `aof_replay` validates each frame before executing it:
+
+- `len > 0` — a length of zero is not a valid command.
+- `len < 1 MB` — a length above this threshold is treated as corruption (e.g., a garbage byte sequence that looks like a huge integer).
+- `fread` reads exactly `len` bytes — if the file ends before `len` bytes are available, the frame is incomplete.
+
+If any check fails, replay stops at that frame. The commands before it — all complete and `fsync`'d — have already been applied. The partial frame at the end is silently discarded.
+
+<Note>
+  Stopping replay at a corrupt frame is correct behavior. Those commands never completed from the client's perspective (the crash happened before the reply was sent), so discarding them does not violate durability guarantees.
+</Note>
+
+## Atomic AOF rewrite
+
+Compaction replaces the AOF with a minimal log containing only the current state. The replacement must be crash-safe: if the process dies during the rewrite, the original AOF must remain intact.
+
+RadishDB achieves this with a write-to-temp, then rename pattern:
+
+```c aof.c
+// 1. Write the new compacted log to a temporary file
+FILE *tmp = fopen("aof/radish.aof.tmp", "wb");
+// ... write all live entries ...
+fsync(fileno(tmp));
+fclose(tmp);
+
+// 2. Atomically replace the old AOF with the new one
+rename("aof/radish.aof.tmp", "aof/radish.aof");
+```
+
+On POSIX systems, `rename` is atomic: a concurrent reader will see either the old file or the new file, never a zero-byte or partially written file. If the process crashes before `rename`, the `.tmp` file is abandoned and the original AOF is untouched. If it crashes after `rename`, the new compact AOF is already in place.
+
+<Tip>
+  The `aof/` directory must exist and be writable before RadishDB starts. In Docker, this is handled by the volume mount at `/app/aof`. For native installs, create the directory manually: `mkdir -p aof`.
+</Tip>
+
+## What crash recovery does not cover
+
+| Scenario | Outcome |
+|----------|----------|
+| Process killed mid-`fsync` | Partial frame at AOF tail; discarded on next replay. No data loss for completed commands. |
+| Disk full during write | `fwrite` or `fsync` returns an error. The command fails. RadishDB does not currently retry or halt on disk-full. |
+| Snapshot (`LOAD`) followed by crash | State reverts to the snapshot. Commands issued after `LOAD` but before a restart are in the AOF and will be replayed on top of the snapshot — but only if `LOAD` updated the AOF, which it does not do automatically. |
+| Hardware storage failure | No protection. AOF durability depends on the underlying storage being reliable. |
+
+<Warning>
+  After a `LOAD` command, the AOF and in-memory state may diverge. To sync them, trigger an AOF rewrite immediately after loading a snapshot: restart RadishDB, and the startup rewrite will compact the AOF to match the current (post-load) state.
+</Warning>

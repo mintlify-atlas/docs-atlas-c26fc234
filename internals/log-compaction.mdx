@@ -1,0 +1,205 @@
+---
+title: "Log compaction"
+description: "How RadishDB's AOF rewrite keeps disk usage bounded"
+---
+
+The AOF records every mutation. Over time this produces a file full of redundant history: if a key is updated 1,000 times, the AOF contains 1,000 `SET` records, but only the last one matters for the current state. **Log compaction** discards this history and replaces the AOF with a minimal representation of what the database looks like right now.
+
+## Why compaction is needed
+
+Consider a key that is updated frequently:
+
+```
+[before compaction]
+SET counter 1
+SET counter 2
+SET counter 3
+...1000 more records...
+SET counter 1003
+```
+
+On startup, replaying this AOF executes 1,003 `SET` commands to produce one key with value `1003`. After compaction:
+
+```
+[after compaction]
+SET counter 1003
+```
+
+One record. Same result. Compaction does not change what the database contains — it changes how long it takes to reconstruct it from the log.
+
+<Columns cols={2}>
+  <Card title="Bounded disk usage" icon="hard-drive">
+    The AOF cannot grow without limit. After compaction, file size is proportional to the number of live keys, not the total write volume.
+  </Card>
+  <Card title="Faster startup" icon="bolt">
+    A smaller AOF replays faster. A database with 10,000 keys but 1,000,000 historical writes restarts in milliseconds after compaction, not seconds.
+  </Card>
+  <Card title="TTL cleanup" icon="clock">
+    Compaction skips expired keys. They are never written to the new AOF, so they do not consume replay time on restart.
+  </Card>
+  <Card title="Crash safety" icon="shield">
+    The rewrite is atomic: it writes to a `.tmp` file first, then renames into place. A crash during rewrite leaves the old AOF intact.
+  </Card>
+</Columns>
+
+## The rewrite algorithm
+
+`aof_rewrite` produces a new AOF by serializing the current in-memory state:
+
+```c aof.c
+void aof_rewrite(HashTable *ht, const char *filename) {
+  FILE *tmp = fopen("aof/radish.aof.tmp", "wb");
+
+  // Write AOFX1 header
+  fwrite(AOF_MAGIC, 1, AOF_MAGIC_LEN, tmp);   // "AOFX1"
+  uint64_t base_size = 0;
+  fwrite(&base_size, sizeof(uint64_t), 1, tmp); // placeholder
+
+  // Serialize each non-expired entry
+  for each bucket in ht {
+    for each entry in bucket {
+      if (entry is expired) continue;
+
+      if (entry->expires_at != 0) {
+        long remaining = entry->expires_at - time(NULL);
+        // write: "SET key value EX <remaining>"
+      } else {
+        // write: "SET key value"
+      }
+    }
+  }
+
+  fsync(tmp);
+
+  // Update base_size in header with actual compact file size
+  uint64_t actual_size = ftell(tmp);
+  fseek(tmp, AOF_MAGIC_LEN, SEEK_SET);
+  fwrite(&actual_size, sizeof(uint64_t), 1, tmp);
+  fclose(tmp);
+
+  rename("aof/radish.aof.tmp", filename);  // atomic replacement
+
+  // Re-open for appending
+  aof_file = fopen(filename, "ab");
+}
+```
+
+Key points:
+
+- Only non-expired entries are written. Dead keys vanish from the log.
+- TTL keys write remaining seconds (`expires_at - now`), not the original TTL. This preserves the correct expiry on replay.
+- `fsync` is called before `rename` to ensure the new file is fully written to disk before it becomes visible.
+- `rename` is atomic on POSIX systems — a reader sees either the old file or the new file, never a partially-written intermediate.
+
+## AOFX1 header and base_size
+
+The AOFX1 header written by `aof_rewrite` contains a `base_size` field:
+
+```
+┌────────────────────────────────────────────────────────────┐
+│  [5 bytes]  "AOFX1"                                        │
+│  [8 bytes]  base_size: uint64_t                            │
+└────────────────────────────────────────────────────────────┘
+```
+
+`base_size` records the file size immediately after the last compaction. It serves as a watermark: any bytes beyond `base_size` are new mutations written since the last rewrite.
+
+At startup and during the REPL loop, RadishDB reads `base_size` from the header:
+
+```c repl.c
+size_t aof_base_size = aof_header_filesize("aof/radish.aof");
+size_t aof_size      = aof_filesize("aof/radish.aof");
+```
+
+If `base_size` is zero (the file was never rewritten, or the header is absent), the entire file is treated as growth since the last compaction.
+
+## Trigger condition
+
+Compaction fires automatically when the AOF has grown to more than **2× its post-compaction size**:
+
+```c repl.c
+void repl_loop(HashTable *ht, size_t aof_size) {
+  while (1) {
+    expire_sweep(ht, 10);
+
+    size_t aof_base_size = aof_header_filesize("aof/radish.aof");
+    aof_size = aof_filesize("aof/radish.aof");
+
+    if (aof_size > aof_base_size * 2) {
+      printf("[AOF] rewrite (%zu bytes)\n", aof_size);
+      aof_rewrite(ht, "aof/radish.aof");
+    }
+
+    // ... prompt, read, execute, print
+  }
+}
+```
+
+This check runs on every REPL iteration — after each command. The `2×` ratio is hardcoded. It means RadishDB tolerates up to 100% write amplification before compacting. A more write-heavy workload compacts more frequently; a read-heavy workload may never compact at all.
+
+## Startup compaction
+
+Compaction is also evaluated at startup, before the first prompt is displayed:
+
+- If `aof_size > aof_base_size * 2`, a rewrite runs immediately.
+- If the AOF has no AOFX1 header (old format or first run after upgrade), `base_size` is treated as zero, which always triggers a rewrite.
+
+This ensures that a large pre-existing AOF from a crash or long-running session is compacted before any new commands are processed, keeping startup replay time bounded.
+
+## Rewrite output vs old AOF: a comparison
+
+**Before rewrite** — raw AOF with history:
+
+```
+[AOFX1 header: base_size=141]
+[4]  SET name alice
+[4]  SET name bob          ← overwrites alice
+[4]  SET counter 1
+[4]  SET counter 2
+[4]  SET counter 3
+[4]  DEL temp
+[4]  SET session abc EX 300
+```
+
+**After rewrite** — minimal current state:
+
+```
+[AOFX1 header: base_size=NEW_SIZE]
+[4]  SET name bob
+[4]  SET counter 3
+[4]  SET session abc EX 287   ← remaining TTL, not original 300
+```
+
+Three records instead of seven. `temp` is gone (it was deleted). `session`'s TTL reflects how many seconds remain, not how many were originally set. On replay, the hash table is identical to what it was at rewrite time.
+
+## Effect on startup time
+
+Startup time scales with the number of records in the AOF, not the total write volume. Without compaction:
+
+- 1M writes to 1K unique keys = 1M replay operations
+- Startup time is proportional to write volume
+
+With compaction triggered at 2× growth:
+
+- The AOF is rewritten whenever it doubles in size
+- After rewrite, AOF contains at most `current_key_count` records
+- Startup time is proportional to current key count
+
+For a database with 10,000 live keys and 10M historical writes, compaction keeps startup under a second. Without compaction, the same workload could take minutes to replay.
+
+<Note>
+  RadishDB performs AOF rewrite in-process on the main thread — there is no background fork. Unlike Redis, which uses `fork()` + copy-on-write to rewrite in a child process, RadishDB's rewrite briefly blocks command processing while it iterates the hash table. For datasets that fit comfortably in memory, this typically completes in milliseconds.
+</Note>
+
+## Summary
+
+| Property | Value |
+|----------|-------|
+| Trigger condition | `aof_size > aof_base_size * 2` |
+| Trigger frequency | Checked on every REPL iteration |
+| Growth ratio tolerated | 2× (100% write amplification) |
+| Temp file | `aof/radish.aof.tmp` |
+| Replacement method | `rename()` — atomic on POSIX |
+| Expired keys in output | Excluded |
+| TTL in output | Remaining seconds at time of rewrite |
+| Background process | None — runs on the main thread |

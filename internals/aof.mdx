@@ -1,0 +1,201 @@
+---
+title: "Append-only file (AOF)"
+description: "How RadishDB implements write-ahead logging using a length-prefixed binary format"
+---
+
+Every mutation in RadishDB — every `SET` and `DEL` — is written to an **append-only file** before the command returns. This is the same pattern used in write-ahead logging (WAL) in databases like PostgreSQL and SQLite: the log is the source of truth for durability, and the in-memory state is a projection of it.
+
+If the process crashes between two writes, the AOF records exactly which commands completed. On the next startup, replaying the file rebuilds the in-memory state byte-for-byte.
+
+## File location
+
+The AOF lives at `aof/radish.aof` relative to the working directory. The `aof/` directory must exist before the first run — RadishDB does not create it.
+
+```bash
+# Create the directory before starting RadishDB
+mkdir -p aof
+./radishdb server
+```
+
+If the file does not exist, `aof_replay` treats that as a clean start and returns without error. The file is created on the first write.
+
+## Binary format
+
+The AOF is **not** a plain-text log. It uses a compact length-prefixed binary format:
+
+```
+┌────────────────────────────────────────────────────────────────┐
+│  Header                                                        │
+│    [5 bytes]  Magic: "AOFX1"                                   │
+│    [8 bytes]  base_size: uint64_t  (0 after first open)        │
+├────────────────────────────────────────────────────────────────┤
+│  Record 1                                                      │
+│    [4 bytes]  length: uint32_t                                 │
+│    [N bytes]  command string (not null-terminated on disk)     │
+├────────────────────────────────────────────────────────────────┤
+│  Record 2                                                      │
+│    [4 bytes]  length: uint32_t                                 │
+│    [N bytes]  command string                                   │
+├────────────────────────────────────────────────────────────────┤
+│  ...                                                           │
+└────────────────────────────────────────────────────────────────┘
+```
+
+Each record is a **length prefix** followed by the command bytes. The command is stored as a human-readable string:
+
+| Command | Format on disk |
+|---------|----------------|
+| `SET key value` (no TTL) | `SET key value` |
+| `SET key value EX 300` (with TTL) | `SET key value EX 300` |
+| `DEL key` | `DEL key` |
+
+The 4-byte length prefix acts as a frame delimiter. On replay, RadishDB reads the length first, then reads exactly that many bytes into a buffer, then null-terminates and tokenizes it. No scanning for newlines or delimiters is required.
+
+<Note>
+  Files written by older versions of RadishDB may not have the `AOFX1` header. `aof_replay` detects this by checking the first 5 bytes and falls back to replaying the whole file as a record stream without skipping a header.
+</Note>
+
+## Opening the AOF
+
+```c aof.c
+int aof_open(const char *filename);
+```
+
+`aof_open` opens the file in `"ab+"` mode — append-only writes, read access from any position. This mode creates the file if it does not exist and positions the write cursor at the end. The file descriptor is held in a module-level `aof_file` global for the lifetime of the process.
+
+`aof_close` calls `fclose(aof_file)` and sets the pointer to `NULL`.
+
+## Writing a SET record
+
+```c aof.c
+void aof_append_set(const char *key, const char *value, const char *expire_at) {
+  char buffer[256];
+  // Builds: "SET key value" or "SET key value EX N"
+  uint32_t length = strlen(buffer);
+  fwrite(&length, sizeof(uint32_t), 1, aof_file);
+  fwrite(buffer, length, 1, aof_file);
+  fflush(aof_file);
+  fsync(fileno(aof_file));
+}
+```
+
+The sequence is always:
+
+<Steps>
+  <Step title="Build the command string">
+    Format the command into a stack buffer. If `expire_at` is non-NULL, append `EX <seconds>` to produce `SET key value EX N`.
+  </Step>
+  <Step title="Write the 4-byte length">
+    `fwrite` the `uint32_t` length of the command string. This is the frame header a reader uses to know how many bytes follow.
+  </Step>
+  <Step title="Write the command bytes">
+    `fwrite` the command string itself. No null terminator is written — the length field is the boundary.
+  </Step>
+  <Step title="Flush the user-space buffer">
+    `fflush` moves the data from the C `FILE *` buffer into the kernel's page cache. Without this step, the data could sit in libc's buffer and be lost on a crash.
+  </Step>
+  <Step title="fsync to disk">
+    `fsync(fileno(aof_file))` instructs the kernel to flush its page cache to the physical storage device. After `fsync` returns, the record survives a power loss.
+  </Step>
+</Steps>
+
+## Writing a DEL record
+
+`aof_append_del` follows the identical pattern, writing `DEL key` as the command string:
+
+```c aof.c
+void aof_append_del(const char *key) {
+  char buffer[256];
+  snprintf(buffer, sizeof(buffer), "DEL %s", key);
+  uint32_t length = strlen(buffer);
+  fwrite(&length, sizeof(uint32_t), 1, aof_file);
+  fwrite(buffer, length, 1, aof_file);
+  fflush(aof_file);
+  fsync(fileno(aof_file));
+}
+```
+
+## fsync semantics
+
+`fflush` and `fsync` serve different purposes and both are necessary:
+
+| Call | What it does | What it does NOT do |
+|------|-------------|---------------------|
+| `fflush` | Drains the libc `FILE *` buffer to the kernel | Does not guarantee physical disk write |
+| `fsync` | Forces the kernel to flush its page cache to disk | Does not control libc buffering |
+
+Calling only `fflush` protects against process crashes but not kernel crashes or power loss. Calling only `fsync` on a buffered `FILE *` may not write anything because the data is still in libc's buffer. RadishDB calls both, in order, after every record.
+
+<Warning>
+  `fsync` is expensive — a typical NVMe SSD has a sync latency of 50–200 µs. On spinning disks it can be 5–10 ms. Every `SET` and `DEL` blocks until the hardware acknowledges the write. This is intentional: RadishDB prioritizes durability over throughput.
+</Warning>
+
+## Replaying the AOF
+
+At startup, `aof_replay` reconstructs the in-memory hash table by replaying every record:
+
+```c aof.c
+int aof_replay(HashTable *h, const char *filename);
+```
+
+<Steps>
+  <Step title="Open the file">
+    Open for reading. If the file does not exist, return `1` immediately — this is a clean start, not an error.
+  </Step>
+  <Step title="Check for AOFX1 header">
+    Read the first 5 bytes and compare to `"AOFX1"`. If they match, skip the 8-byte `base_size` field (13 bytes total) and begin reading records. If they do not match, seek back to the beginning and replay from byte 0 (old format compatibility).
+  </Step>
+  <Step title="Read length-prefixed records">
+    For each record:
+    1. Read a `uint32_t` length.
+    2. Sanity-check: skip if `len == 0` or `len > 1 MB`.
+    3. `malloc(len + 1)` and `fread` exactly `len` bytes.
+    4. Null-terminate the buffer.
+    5. Tokenize into command + arguments.
+    6. Dispatch `SET` or `DEL` against the hash table.
+  </Step>
+  <Step title="Stop on short read">
+    If `fread` returns fewer bytes than expected, the file was truncated mid-write (e.g., a crash during `fwrite`). Replay stops at that point. The partial record is discarded — the preceding records are already applied.
+  </Step>
+</Steps>
+
+The function always returns `1`. A missing file is not an error; a truncated file is silently trimmed at the last clean record.
+
+## Partial write protection
+
+Two sanity checks guard against corrupt records:
+
+```c aof.c
+if (len == 0 || len > 1024 * 1024) {
+  // skip — frame header is corrupt
+  break;
+}
+```
+
+A length of zero means an empty write somehow reached disk. A length over 1 MB indicates bit corruption or a stale file pointer. Either condition stops replay cleanly rather than allocating unbounded memory.
+
+## First-run behaviour
+
+On the very first run, no AOF file exists:
+
+1. `aof_replay` is called with `"aof/radish.aof"` — the file is not found, replay returns immediately.
+2. The in-memory hash table starts empty.
+3. `aof_open` is called — this creates the file.
+4. The first `SET` command triggers `aof_append_set`, which writes the `AOFX1` header implicitly via the rewrite path, or appends directly if this is a fresh file.
+
+No configuration is required. The AOF bootstraps itself on first use.
+
+<Columns cols={2}>
+  <Card title="Durability" icon="shield-check">
+    Every write is fsynced before the command returns. A process kill or power loss after any successful command loses zero data.
+  </Card>
+  <Card title="Crash recovery" icon="rotate-right">
+    Replaying the AOF on startup reconstructs the exact pre-crash state. RadishDB does not need a separate recovery procedure.
+  </Card>
+  <Card title="Compaction" icon="compress">
+    The AOF is periodically rewritten to discard obsolete history. See [Log compaction](/internals/log-compaction) for the algorithm and trigger conditions.
+  </Card>
+  <Card title="Format compatibility" icon="file-check">
+    The AOFX1 magic header allows the format to evolve. Old files without the header are replayed in legacy mode without data loss.
+  </Card>
+</Columns>

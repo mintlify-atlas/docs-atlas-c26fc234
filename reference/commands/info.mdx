@@ -1,0 +1,124 @@
+---
+title: "INFO"
+description: "Display database statistics and internal metrics"
+---
+
+Return a multi-line string containing runtime statistics, key counts, and internal hash table metrics.
+
+## Syntax
+
+```bash
+INFO
+```
+
+## Parameters
+
+None.
+
+## Return value
+
+A formatted multi-line string. The output is grouped into three sections: server metadata, key statistics, and hash table internals.
+
+```
+Version : 0.1
+Uptime Seconds :42
+
+Keys : 5
+Keys with TTL : 2
+Expired keys : 0
+
+Buckets : 16
+Load Factor : 0.312500
+Resizes : 1
+Max chain : 1
+```
+
+### Field reference
+
+**Server**
+
+<ResponseField name="Version" type="string">
+  RadishDB version number.
+</ResponseField>
+
+<ResponseField name="Uptime Seconds" type="integer">
+  Number of seconds since the RadishDB process started.
+</ResponseField>
+
+**Keys**
+
+<ResponseField name="Keys" type="integer">
+  Number of keys currently tracked by the hash table (`ht->count`). May include keys that have logically expired but have not yet been passively swept.
+</ResponseField>
+
+<ResponseField name="Keys with TTL" type="integer">
+  Number of keys that have a non-zero `expires_at` value — that is, keys created with the `EX` option.
+</ResponseField>
+
+<ResponseField name="Expired keys" type="integer">
+  Number of keys whose `expires_at` is in the past (logically expired) but that have not yet been removed from memory.
+</ResponseField>
+
+**Hash table internals**
+
+<ResponseField name="Buckets" type="integer">
+  Total number of buckets allocated in the hash table. The initial size is 8 and doubles on each resize.
+</ResponseField>
+
+<ResponseField name="Load Factor" type="float">
+  Ratio of `Keys / Buckets`. A load factor approaching or exceeding 1.0 indicates that a resize is imminent or overdue.
+</ResponseField>
+
+<ResponseField name="Resizes" type="integer">
+  Number of times the hash table has been grown since the process started.
+</ResponseField>
+
+<ResponseField name="Max chain" type="integer">
+  Length of the longest bucket chain. A value greater than 3–4 may indicate a poor hash distribution or a very high load factor.
+</ResponseField>
+
+## Examples
+
+```bash
+>>> INFO
+Version : 0.1
+Uptime Seconds :14
+
+Keys : 3
+Keys with TTL : 1
+Expired keys : 0
+
+Buckets : 8
+Load Factor : 0.375000
+Resizes : 0
+Max chain : 1
+```
+
+After a large `BENCH` run:
+
+```bash
+>>> BENCH 50000
+Inserted 50000 entries in 0.02 seconds.
+>>> INFO
+Version : 0.1
+Uptime Seconds :31
+
+Keys : 50000
+Keys with TTL : 0
+Expired keys : 0
+
+Buckets : 65536
+Load Factor : 0.762939
+Resizes : 13
+Max chain : 4
+```
+
+## Notes
+
+<Note>
+  The `Expired keys` count may be greater than zero even when all keys appear accessible. These are keys that have passed their TTL but have not yet been touched by a `GET` or `TTL` call to trigger passive removal.
+</Note>
+
+<Info>
+  `INFO` is read-only and has no side effects. It does not trigger expiry sweeps or modify any state.
+</Info>

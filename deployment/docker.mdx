@@ -1,0 +1,174 @@
+---
+title: "Docker"
+description: "Deploy RadishDB using Docker"
+---
+
+RadishDB ships as a multi-stage Docker image. The `builder` stage compiles the binary with GCC; the runtime stage runs it on a minimal `debian:bookworm-slim` base, keeping the final image small.
+
+## Initial deploy
+
+<Steps>
+  <Step title="Pull the image">
+    Fetch the latest RadishDB image from Docker Hub:
+
+    ```bash
+    docker pull piee314/radishdb:latest
+    ```
+  </Step>
+
+  <Step title="Create a named volume">
+    RadishDB writes all data to `/app/aof/radish.aof`. Create a named volume so the file persists independently of the container:
+
+    ```bash
+    docker volume create radish-data
+    ```
+
+    <Note>
+      Data lives at `/app/aof/radish.aof` inside the container. Mounting a named volume at `/app/aof` is the recommended way to make writes durable across container lifecycle events.
+    </Note>
+  </Step>
+
+  <Step title="Run the container">
+    Start RadishDB with port mapping and volume mount:
+
+    ```bash
+    docker run -d \
+      --name radishdb \
+      -p 6379:6379 \
+      -v radish-data:/app/aof \
+      piee314/radishdb:latest
+    ```
+
+    Flag breakdown:
+
+    | Flag | Purpose |
+    |---|---|
+    | `-d` | Run in detached (background) mode |
+    | `--name radishdb` | Assign a stable name for subsequent commands |
+    | `-p 6379:6379` | Map host port 6379 to container port 6379 |
+    | `-v radish-data:/app/aof` | Mount the named volume at the AOF directory |
+  </Step>
+
+  <Step title="Verify the container is running">
+    ```bash
+    docker ps --filter name=radishdb
+    ```
+
+    Connect and send a test command:
+
+    ```bash
+    echo "SET ping pong" | nc localhost 6379
+    ```
+
+    Expected output:
+
+    ```
+    OK
+    ```
+  </Step>
+</Steps>
+
+## Volume management
+
+List all volumes and confirm `radish-data` exists:
+
+```bash
+docker volume ls
+```
+
+Inspect volume details, including the host mount path:
+
+```bash
+docker volume inspect radish-data
+```
+
+The `Mountpoint` field shows where Docker stores the AOF file on the host. You can copy the file out for backup:
+
+```bash
+docker run --rm \
+  -v radish-data:/data \
+  debian:bookworm-slim \
+  cat /data/radish.aof > radish-backup.aof
+```
+
+## Container lifecycle
+
+Stop the container gracefully:
+
+```bash
+docker stop radishdb
+```
+
+Start it again (data is recovered from the AOF on startup):
+
+```bash
+docker start radishdb
+```
+
+View live logs:
+
+```bash
+docker logs -f radishdb
+```
+
+Remove the container (the volume and its data are preserved):
+
+```bash
+docker rm radishdb
+```
+
+To also remove the volume and all stored data:
+
+```bash
+docker rm radishdb
+docker volume rm radish-data
+```
+
+## How the image is built
+
+The `Dockerfile` uses a two-stage build:
+
+```dockerfile
+# Stage 1 — compile
+FROM gcc:13 AS builder
+WORKDIR /build
+COPY src ./src
+COPY Makefile .
+RUN make
+
+# Stage 2 — runtime
+FROM debian:bookworm-slim
+WORKDIR /app
+COPY --from=builder /build/radishdb .
+RUN mkdir -p /app/aof
+EXPOSE 6379
+VOLUME ["/app/aof"]
+ENTRYPOINT ["./radishdb"]
+CMD ["--server"]
+```
+
+**Stage 1 (builder):** Pulls the full GCC 13 toolchain, copies source files, and runs `make`. The resulting `radishdb` binary is the only artifact carried forward.
+
+**Stage 2 (runtime):** Starts from `debian:bookworm-slim` — no compiler, no build tools. The binary is copied in, the AOF directory is created, port 6379 is declared, and the default command is `--server`.
+
+This keeps the final image lean: the GCC layer is discarded and never shipped.
+
+## Overriding the startup command
+
+The default `CMD ["--server"]` runs RadishDB in TCP server mode. You can override it at runtime:
+
+```bash
+# Print the version and exit
+docker run --rm piee314/radishdb:latest --version
+
+# Print help and exit
+docker run --rm piee314/radishdb:latest --help
+```
+
+Interactive REPL mode is not useful inside a non-interactive container, but you can attach a TTY for debugging:
+
+```bash
+docker run -it --rm \
+  -v radish-data:/app/aof \
+  piee314/radishdb:latest
+```

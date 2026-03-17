@@ -1,0 +1,77 @@
+---
+title: "Introduction"
+description: "A Redis-inspired in-memory key-value database written in C, featuring write-ahead logging, crash recovery, TTL expiration, and a TCP server."
+---
+
+# RadishDB
+
+RadishDB is a **Redis-inspired, in-memory key-value database** written in C. It implements real storage engine internals — write-ahead logging, crash recovery, TTL expiration, log compaction, binary snapshots, and a TCP server — following patterns used in Redis, RocksDB, and PostgreSQL.
+
+<CardGroup cols={2}>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Get RadishDB running in minutes using Docker or building from source
+  </Card>
+  <Card title="Command Reference" icon="terminal" href="/reference/commands/set">
+    Explore all supported commands: SET, GET, DEL, TTL, and more
+  </Card>
+  <Card title="Architecture" icon="diagram-project" href="/concepts/architecture">
+    Understand the protocol-agnostic engine design
+  </Card>
+  <Card title="C API" icon="code" href="/reference/api/hashtable">
+    Embed RadishDB directly in your C programs using the internal API
+  </Card>
+</CardGroup>
+
+## Key features
+
+<CardGroup cols={2}>
+  <Card title="Write-ahead logging" icon="file-lines">
+    Every mutation is written to an append-only file (AOF) before being applied, guaranteeing crash safety
+  </Card>
+  <Card title="Crash recovery" icon="shield-check">
+    On startup, RadishDB replays the AOF to restore state deterministically after any crash
+  </Card>
+  <Card title="TTL & expiration" icon="clock">
+    Per-key time-to-live with both passive expiration on read and active background sweeping
+  </Card>
+  <Card title="Log compaction" icon="compress">
+    AOF rewrite serializes current state into a compact log, removing obsolete history
+  </Card>
+  <Card title="Binary snapshots" icon="floppy-disk">
+    Save and restore full database state with the `.rdbx` snapshot format
+  </Card>
+  <Card title="TCP server" icon="network-wired">
+    Serve clients over TCP on port 6379 — connect with netcat, telnet, or any socket client
+  </Card>
+  <Card title="Interactive REPL" icon="rectangle-terminal">
+    Built-in REPL mode for local development and exploration
+  </Card>
+  <Card title="Docker support" icon="docker">
+    Multi-stage Dockerfile and Docker Compose for containerized deployment
+  </Card>
+</CardGroup>
+
+## Architecture overview
+
+RadishDB separates storage from protocol handling:
+
+```
+engine.c      → command parsing and semantics (no I/O)
+hashtable.c   → core storage engine
+aof.c         → write-ahead log (durability)
+expires.c     → TTL and expiration sweeper
+persistence.c → binary snapshot (.rdbx)
+repl.c        → interactive REPL frontend
+server.c      → TCP server frontend
+main.c        → startup and lifecycle
+```
+
+This design means the same engine powers both the REPL and the TCP server, with no duplication of command logic.
+
+## Project status
+
+RadishDB is a **stable learning release** — architecturally serious, fully functional, and containerized for real deployment.
+
+<Note>
+  RadishDB is single-threaded by design. It does not support replication, clustering, or SQL queries. See [Architecture](/concepts/architecture) for intentional design decisions.
+</Note>

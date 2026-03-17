@@ -1,0 +1,180 @@
+---
+title: "Persistence"
+description: "How RadishDB keeps data safe across restarts using AOF and snapshots"
+---
+
+RadishDB provides two complementary persistence mechanisms:
+
+- **Append-only file (AOF)** — a write-ahead log that records every mutation as it happens, enabling crash recovery with no data loss.
+- **Snapshots (.rdbx)** — a compact binary representation of the entire database at a point in time, useful for backups and fast restores.
+
+You can use both simultaneously. AOF handles durability; snapshots handle portability.
+
+<Tabs>
+  <Tab title="AOF">
+    **What it is**: A sequential log file where every `SET` and `DEL` is appended immediately and flushed to disk with `fsync`.
+
+    **Durability**: Near-zero data loss. At most one in-flight command is at risk during a crash.
+
+    **Recovery**: On startup, RadishDB replays every entry in the AOF to reconstruct the in-memory state.
+
+    **Compaction**: AOF grows over time. RadishDB rewrites it periodically (and at startup) to remove obsolete history.
+
+    **Best for**: Production use where you cannot afford to lose writes.
+  </Tab>
+  <Tab title="Snapshots (.rdbx)">
+    **What it is**: A binary file serializing the entire hash table — keys, values, and TTLs — at the moment `SAVE` is called.
+
+    **Durability**: Point-in-time only. Any writes after the snapshot was taken are not captured.
+
+    **Recovery**: Load with the `LOAD` command. The database is replaced atomically with the snapshot contents.
+
+    **Compaction**: Not applicable. Each `SAVE` produces a self-contained file.
+
+    **Best for**: Backups, migrating data between instances, and fast full restores.
+  </Tab>
+</Tabs>
+
+## AOF: append-only file
+
+### File location
+
+The AOF lives at `aof/radish.aof` relative to the working directory. In the Docker image this resolves to `/app/aof/radish.aof`, which is the volume mount point.
+
+```bash
+# Native
+./radishdb server
+# → writes to ./aof/radish.aof
+
+# Docker
+docker run -v radish-data:/app/aof pie314/radishdb
+# → writes to /app/aof/radish.aof (inside the volume)
+```
+
+### Binary format
+
+The AOF uses a length-prefixed binary format, not plain text:
+
+```
+┌──────────────┬────────────────────────────────────────────────┐
+│  Header      │  "AOFX1" (5 bytes magic)                       │
+│              │  base_size: uint64_t (8 bytes)                  │
+├──────────────┼────────────────────────────────────────────────┤
+│  Entry 1     │  length: uint32_t                              │
+│              │  command: <length> bytes (e.g. "SET k v")      │
+├──────────────┼────────────────────────────────────────────────┤
+│  Entry 2     │  length: uint32_t                              │
+│              │  command: <length> bytes                        │
+├──────────────┼────────────────────────────────────────────────┤
+│  ...         │                                                │
+└──────────────┴────────────────────────────────────────────────┘
+```
+
+The 4-byte length prefix before each command acts as a frame delimiter. On replay, RadishDB reads the length first, then reads exactly that many bytes. A length of zero or greater than 1 MB is treated as a corrupt frame and stops the replay.
+
+### Writing to the AOF
+
+Every `SET` (with or without a TTL) writes a record immediately:
+
+```c aof.c
+void aof_append_set(const char *key, const char *value, const char *expire_at) {
+  char buffer[256];
+  // Produces "SET key value" or "SET key value EX seconds"
+  uint32_t length = strlen(buffer);
+  fwrite(&length, sizeof(uint32_t), 1, aof_file);
+  fwrite(buffer, length, 1, aof_file);
+  fflush(aof_file);
+  fsync(fileno(aof_file));  // flush kernel buffers to disk
+}
+```
+
+`fsync` is called after every write. This is the slowest — and safest — durability mode: each command is durable before `execute_command` returns.
+
+### AOF rewrite (compaction)
+
+Every `SET` appends to the file, even if the same key has been updated many times. Over time the AOF accumulates redundant history. Rewrite discards this history and replaces the file with a minimal log representing only the current state:
+
+```c aof.c
+void aof_rewrite(HashTable *ht, const char *filename) {
+  FILE *tmp = fopen("aof/radish.aof.tmp", "wb");
+  fwrite(AOF_MAGIC, 1, AOF_MAGIC_LEN, tmp);         // magic header
+  uint64_t base_size = 0;
+  fwrite(&base_size, sizeof(uint64_t), 1, tmp);      // placeholder
+
+  // Write each non-expired key as a SET command
+  for each entry in ht {
+    if expired → skip;
+    write "SET key value" or "SET key value EX remaining_ttl"
+  }
+
+  fsync(tmp);
+  // Update base_size in header
+  fclose(tmp);
+  rename("aof/radish.aof.tmp", filename);  // atomic rename
+}
+```
+
+The rename at the end is atomic on POSIX systems: a reader will see either the old file or the new file, never a partial state.
+
+Rewrite is triggered automatically:
+- **At startup**, if `aof_size > aof_base_size * 2` or the base size is zero.
+- **During the REPL loop**, if the file has grown beyond 2× its post-rewrite size.
+
+## Snapshots: the .rdbx format
+
+### Binary layout
+
+A `.rdbx` snapshot is a self-contained binary file:
+
+```
+┌────────────┬──────────────────────────────────────────────┐
+│ Magic      │ "RDBX1" (5 bytes)                            │
+├────────────┼──────────────────────────────────────────────┤
+│ Count      │ uint32_t — number of entries                  │
+├────────────┼──────────────────────────────────────────────┤
+│ Entry 1    │ klen: uint32_t                                │
+│            │ key:  klen bytes                              │
+│            │ vlen: uint32_t                                │
+│            │ value: vlen bytes                             │
+│            │ expires_at: time_t (8 bytes)                  │
+├────────────┼──────────────────────────────────────────────┤
+│ Entry 2... │ same structure                                │
+└────────────┴──────────────────────────────────────────────┘
+```
+
+Length-prefixed strings mean the format handles arbitrary binary keys and values without escaping. The `expires_at` field uses the same semantics as the hash table: `0` means no expiry.
+
+### Saving and loading
+
+```c persistence.c
+int ht_save(HashTable *ht, const char *filename);  // writes .rdbx
+int ht_load(HashTable **ht, const char *filename); // replaces *ht from .rdbx
+```
+
+From the command line:
+
+```bash
+>>> SAVE snapshot.rdbx
+OK
+>>> LOAD snapshot.rdbx
+OK
+```
+
+<Warning>
+  `LOAD` replaces the entire in-memory state. Any keys not in the snapshot file are lost. The AOF is **not** updated automatically after a `LOAD` — issue a rewrite or restart to sync them.
+</Warning>
+
+## Choosing between AOF and snapshots
+
+| Concern | AOF | Snapshot |
+|---------|-----|----------|
+| Crash durability | Every write is safe | Only writes before last `SAVE` |
+| Startup recovery | Automatic, on every boot | Manual `LOAD` required |
+| File size | Grows with write volume | Proportional to current key count |
+| Compaction | Automatic rewrite | N/A — each save is already compact |
+| Portability | Tied to AOF format version | Self-contained, copyable |
+| Use case | Always-on durability | Backups, migrations, fast restore |
+
+<Tip>
+  For production deployments, rely on AOF for durability and take periodic snapshots as an additional backup layer. Store snapshots outside the container volume for off-site recovery.
+</Tip>

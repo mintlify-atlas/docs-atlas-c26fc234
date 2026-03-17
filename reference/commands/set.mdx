@@ -1,0 +1,79 @@
+---
+title: "SET"
+description: "Set a key to a string value, optionally with a TTL"
+---
+
+Store a string value under a key. If the key already exists, its value and TTL are overwritten.
+
+## Syntax
+
+```bash
+SET key value
+SET key value EX seconds
+```
+
+## Parameters
+
+<ParamField path="key" type="string" required>
+  The name of the key to set.
+</ParamField>
+
+<ParamField path="value" type="string" required>
+  The string value to store.
+</ParamField>
+
+<ParamField path="EX" type="keyword">
+  Optional flag to enable a time-to-live. Must be followed by a non-negative integer.
+</ParamField>
+
+<ParamField path="seconds" type="integer">
+  Expiry duration in seconds from the current time. Must be `>= 0`. Required when `EX` is provided.
+</ParamField>
+
+## Return value
+
+Returns `OK` on success.
+
+## Errors
+
+| Condition | Error message |
+|---|---|
+| Wrong number of arguments | `(error) wrong number of arguments for 'SET'` |
+| `seconds` is negative | No response — the command is silently ignored |
+
+## Examples
+
+```bash
+>>> SET name radish
+OK
+
+>>> SET color red EX 30
+OK
+
+>>> SET counter 0
+OK
+```
+
+Overwrite an existing key and remove its TTL:
+
+```bash
+>>> SET session abc123 EX 60
+OK
+>>> TTL session
+(integer) 58
+
+>>> SET session abc123
+OK
+>>> TTL session
+(integer) -1
+```
+
+## Notes
+
+<Note>
+  `SET` without `EX` stores `expires_at = 0`, which means the key has no expiration. If the key previously had a TTL, that TTL is cleared.
+</Note>
+
+<Info>
+  Every `SET` call is immediately appended to the append-only file (AOF), so the write is durable before the command returns.
+</Info>

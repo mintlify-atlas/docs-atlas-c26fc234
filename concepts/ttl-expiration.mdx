@@ -1,0 +1,156 @@
+---
+title: "TTL and expiration"
+description: "How RadishDB handles per-key time-to-live and background expiration"
+---
+
+RadishDB supports per-key expiration using the same model as Redis: you attach a TTL (time-to-live) to a key when you set it, and the key is automatically deleted once that time has elapsed.
+
+Expiration is handled by two complementary mechanisms: **passive expiry** (delete on access) and **active expiry** (background sweep).
+
+## Setting a TTL
+
+Pass `EX seconds` to `SET` to attach an expiration time:
+
+```bash
+>>> SET session:abc token123 EX 3600
+OK
+>>> TTL session:abc
+3599
+```
+
+Internally, RadishDB converts the relative seconds to an **absolute Unix timestamp** and stores it in `entry->expires_at`:
+
+```c hashtable.c
+// When SET ... EX seconds is received:
+entry->expires_at = time(NULL) + seconds;
+```
+
+A key set without `EX` has `expires_at == 0`, which means "never expires".
+
+<Note>
+  RadishDB stores an absolute timestamp, not a countdown. This means TTL accuracy does not degrade if the process sleeps or is paused — the expiry time is fixed at the moment of the `SET` command.
+</Note>
+
+## Passive expiry
+
+Passive expiry happens **inline during a read operation**. When `GET` or `TTL` looks up a key, it checks the timestamp before returning the value:
+
+```c hashtable.c (ht_get)
+char *ht_get(HashTable *ht, const char *key) {
+  // ... locate entry by key ...
+  if (entry->expires_at != 0 && time(NULL) >= entry->expires_at) {
+    ht_delete(ht, key);  // delete and free immediately
+    return NULL;         // report as not found
+  }
+  return entry->value;
+}
+```
+
+If the key is expired, it is deleted from the hash table and its memory is freed before `NULL` is returned. From the caller's perspective, the key never existed.
+
+Passive expiry alone is sufficient for correctness, but it cannot reclaim memory for keys that are never read again. That is the role of the active sweeper.
+
+## Active expiry
+
+The active sweeper scans a portion of the hash table on every command, regardless of what command was issued:
+
+```c expires.c
+static size_t expire_cursor = 0;
+
+void expire_sweep(HashTable *ht, size_t max_checks) {
+  // Scans up to max_checks entries starting at expire_cursor
+  // Deletes entries where expires_at != 0 && expires_at <= now
+  // Advances cursor through buckets (wraps around when it reaches end)
+}
+```
+
+Both frontends call `expire_sweep(ht, 10)` before processing each command:
+
+```c repl.c / server.c
+while (1) {
+  expire_sweep(ht, 10);           // scan 10 entries
+  // ... read and execute command
+}
+```
+
+The cursor advances by 10 entries per command. For a database with 1,000 entries, the entire table is scanned approximately every 100 commands. Expired keys are deleted and their memory is freed immediately.
+
+<Columns cols={2}>
+  <Card title="Passive expiry" icon="eye">
+    Triggered on `GET` and `TTL`. Instant — the key is gone the moment you try to read it after its deadline.
+  </Card>
+  <Card title="Active expiry" icon="rotate">
+    Triggered on every command. Scans 10 entries per command cycle, advancing a cursor that wraps around the full table.
+  </Card>
+</Columns>
+
+## TTL query semantics
+
+The `TTL` command follows Redis conventions:
+
+```c expires.c (ht_ttl)
+long ht_ttl(HashTable *ht, const char *key) {
+  // returns -1  if the key exists but has no expiration
+  // returns -2  if the key does not exist (or has already expired)
+  // returns N   remaining seconds otherwise (N > 0)
+}
+```
+
+```bash
+>>> SET persistent myvalue
+OK
+>>> TTL persistent
+-1
+
+>>> SET temp myvalue EX 60
+OK
+>>> TTL temp
+58
+
+>>> TTL nonexistent
+-2
+```
+
+| Return value | Meaning |
+|-------------|----------|
+| `-1` | Key exists, no TTL set |
+| `-2` | Key not found or already expired |
+| `N > 0` | Seconds remaining until expiry |
+
+## Memory reclamation
+
+When a key expires — whether by passive or active expiry — RadishDB frees its memory immediately:
+
+1. The `Entry` is unlinked from the bucket chain.
+2. `entry->key` is `free`'d.
+3. `entry->value` is `free`'d.
+4. The `Entry` struct itself is `free`'d.
+
+There is no deferred garbage collection or background allocator. Memory returns to the heap as soon as the entry is deleted.
+
+## TTL persistence in the AOF
+
+When the AOF is rewritten, keys with a TTL are written using the **remaining** time-to-live at the moment of the rewrite, not the original TTL:
+
+```c aof.c (during rewrite)
+// For a key with expires_at = 1700001234 and current time = 1700000000:
+remaining = 1700001234 - 1700000000;  // = 1234 seconds
+// Writes: "SET key value EX 1234"
+```
+
+This means a key's expiry continues from where it was, not from when it was originally set. If RadishDB restarts and replays the AOF, the key will still expire at the originally intended wall-clock time — provided the restart happens before the key's deadline.
+
+<Warning>
+  If RadishDB is down for longer than the remaining TTL of a key, that key will be absent from the restored state. This is correct behavior: the key genuinely expired while the process was stopped.
+</Warning>
+
+## Expiry cursor reset
+
+After AOF replay completes on startup, `expire_init(ht)` resets the cursor to zero:
+
+```c main.c
+aof_replay(ht, "aof/radish.aof");
+expire_init(ht);  // reset cursor to start of table
+```
+
+This ensures the sweeper starts from a consistent position after the database has been fully reconstructed.

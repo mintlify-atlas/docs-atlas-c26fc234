@@ -1,0 +1,66 @@
+---
+title: "TTL"
+description: "Get the remaining time-to-live of a key in seconds"
+---
+
+Return how many seconds remain before a key expires. Also indicates whether a key exists and whether it has an expiration set.
+
+## Syntax
+
+```bash
+TTL key
+```
+
+## Parameters
+
+<ParamField path="key" type="string" required>
+  The name of the key to inspect.
+</ParamField>
+
+## Return value
+
+| Return value | Meaning |
+|---|---|
+| `(integer) N` (positive) | Key exists and will expire in N seconds |
+| `(integer) -1` | Key exists but has no expiration |
+| `(integer) -2` | Key does not exist or has already expired |
+
+## Examples
+
+```bash
+>>> SET color red EX 60
+OK
+>>> TTL color
+(integer) 57
+
+>>> SET name radish
+OK
+>>> TTL name
+(integer) -1
+
+>>> TTL missing
+(integer) -2
+```
+
+Checking a key after it expires:
+
+```bash
+>>> SET temp hello EX 2
+OK
+>>> TTL temp
+(integer) 1
+
+# (after 2 seconds)
+>>> TTL temp
+(integer) -2
+```
+
+## Notes
+
+<Note>
+  `TTL` implements passive expiry. If the key has expired at the time of the call, it is deleted from the hash table and `-2` is returned.
+</Note>
+
+<Info>
+  Use [`SET`](/reference/commands/set) with the `EX` option to assign or update a key's TTL. There is no `EXPIRE` command in RadishDB.
+</Info>

@@ -1,0 +1,219 @@
+---
+title: "Binary snapshots (.rdbx)"
+description: "How RadishDB saves and loads full database state using the .rdbx binary format"
+---
+
+A snapshot captures the entire in-memory database — every key, value, and TTL — as a single self-contained binary file. Unlike the AOF, which records mutations continuously, a snapshot is a **point-in-time copy** of the hash table taken at the moment `SAVE` is called.
+
+## Snapshot vs AOF
+
+| Property | AOF | Snapshot (.rdbx) |
+|----------|-----|------------------|
+| Captures | Every individual write | Full state at one moment |
+| Durability | Near-zero data loss | Loses all writes since last `SAVE` |
+| Recovery | Automatic on startup | Manual `LOAD` required |
+| File grows with | Write volume | Current key count |
+| Use case | Continuous durability | Backups, migrations, fast restore |
+
+Both mechanisms can be active simultaneously. The AOF handles ongoing durability; snapshots are the backup and portability layer.
+
+## Creating and loading snapshots
+
+```bash
+# Save the current state to a file
+>>> SAVE mybackup
+OK
+
+# Replace the current in-memory state from a file
+>>> LOAD mybackup
+OK
+```
+
+RadishDB appends `.rdbx` to the filename you provide. `SAVE mybackup` writes `mybackup.rdbx` in the current working directory.
+
+<Warning>
+  `LOAD` replaces the entire in-memory state immediately. Any keys not present in the snapshot file are gone. There is no undo.
+</Warning>
+
+## RDBX binary format
+
+The `.rdbx` format is a compact, sequential binary file:
+
+```
+┌────────────────────────────────────────────────────────────────┐
+│  Magic                                                         │
+│    [5 bytes]  "RDBX1"                                          │
+├────────────────────────────────────────────────────────────────┤
+│  Count                                                         │
+│    [4 bytes]  uint32_t — total number of entries               │
+├────────────────────────────────────────────────────────────────┤
+│  Entry 1                                                       │
+│    [4 bytes]  uint32_t — key length (klen)                     │
+│    [klen]     key string (not null-terminated)                 │
+│    [4 bytes]  uint32_t — value length (vlen)                   │
+│    [vlen]     value string (not null-terminated)               │
+│    [8 bytes]  time_t — expires_at (0 = no expiry)              │
+├────────────────────────────────────────────────────────────────┤
+│  Entry 2...                                                    │
+│    same structure                                              │
+├────────────────────────────────────────────────────────────────┤
+│  ...                                                           │
+└────────────────────────────────────────────────────────────────┘
+```
+
+Length-prefixed strings eliminate the need to scan for null terminators or escape delimiters. Any byte sequence is valid as a key or value. The `expires_at` field carries the same semantics as the in-memory `Entry`: `0` means the key never expires, any other value is an absolute Unix timestamp.
+
+## Saving a snapshot
+
+```c persistence.c
+int ht_save(HashTable *ht, const char *filename);
+```
+
+`ht_save` creates (or overwrites) `filename` and serializes the entire hash table:
+
+<Steps>
+  <Step title="Open the file">
+    Call `fopen(filename, "wb")`. If this fails — for example, due to a permissions error or a missing directory — the function returns `0`.
+  </Step>
+  <Step title="Write the magic header">
+    Write the 5-byte literal `"RDBX1"` to identify the file format.
+
+    ```c
+    fwrite("RDBX1", 1, 5, fp);
+    ```
+  </Step>
+  <Step title="Write the entry count">
+    Write a `uint32_t` containing `ht->count`. The loader uses this to know how many entries to read.
+
+    ```c
+    uint32_t count = ht->count;
+    fwrite(&count, sizeof(uint32_t), 1, fp);
+    ```
+  </Step>
+  <Step title="Serialize each entry">
+    Walk every bucket and every chain. For each entry, write:
+    - `uint32_t klen` — length of the key string
+    - `klen` bytes — the key
+    - `uint32_t vlen` — length of the value string
+    - `vlen` bytes — the value
+    - `time_t expires_at` — the absolute expiry timestamp
+
+    ```c
+    uint32_t klen = strlen(entry->key);
+    fwrite(&klen, sizeof(uint32_t), 1, fp);
+    fwrite(entry->key, klen, 1, fp);
+    uint32_t vlen = strlen(entry->value);
+    fwrite(&vlen, sizeof(uint32_t), 1, fp);
+    fwrite(entry->value, vlen, 1, fp);
+    fwrite(&entry->expires_at, sizeof(time_t), 1, fp);
+    ```
+  </Step>
+  <Step title="Close the file">
+    Call `fclose(fp)`. Return `1` on success.
+  </Step>
+</Steps>
+
+<Note>
+  `ht_save` does not call `fsync`. Snapshot writes trade the full durability guarantee of AOF writes for throughput. The file is consistent when `fclose` returns, but a concurrent power loss during `fclose` may produce a partial file.
+</Note>
+
+## Loading a snapshot
+
+```c persistence.c
+int ht_load(HashTable **ht, const char *filename);
+```
+
+The return type is `RdbStatus`, defined as:
+
+```c persistence.h
+typedef enum {
+  RDB_OK = 1,
+  RDB_ERR_OPEN,   // fopen failed
+  RDB_ERR_MAGIC,  // wrong or missing RDBX1 header
+} RdbStatus;
+```
+
+<Steps>
+  <Step title="Open the file">
+    Call `fopen(filename, "rb")`. If the file does not exist or cannot be opened, return `RDB_ERR_OPEN`.
+  </Step>
+  <Step title="Validate the magic header">
+    Read 5 bytes and compare to `"RDBX1"`. If they do not match, return `RDB_ERR_MAGIC`. This catches truncated files, files from a different tool, or accidental loads of the wrong path.
+  </Step>
+  <Step title="Replace the hash table">
+    Free the existing `*ht` with `ht_free`. Allocate a fresh table with `ht_create(8)` — the minimum size, which grows as entries are loaded.
+
+    ```c
+    ht_free(*ht);
+    *ht = ht_create(8);
+    ```
+  </Step>
+  <Step title="Read the entry count">
+    Read a `uint32_t` to learn how many entries follow.
+  </Step>
+  <Step title="Deserialize each entry">
+    For each of the `count` entries:
+    1. Read `uint32_t klen`, then `klen` bytes into a key buffer. Null-terminate.
+    2. Read `uint32_t vlen`, then `vlen` bytes into a value buffer. Null-terminate.
+    3. Read `time_t expires_at`.
+    4. Call `ht_set(*ht, key, value, expires_at)` to insert the entry.
+
+    `ht_set` handles its own resizing as the table fills. The loaded hash table ends up in exactly the same logical state as when it was saved.
+  </Step>
+  <Step title="Return RDB_OK">
+    Close the file and return `RDB_OK`.
+  </Step>
+</Steps>
+
+## Error handling
+
+```c
+int status = ht_load(&ht, "mybackup.rdbx");
+switch (status) {
+  case RDB_OK:        /* success */          break;
+  case RDB_ERR_OPEN:  /* file not found */   break;
+  case RDB_ERR_MAGIC: /* corrupt header */   break;
+}
+```
+
+| Status | Cause | State after |
+|--------|-------|-------------|
+| `RDB_OK` | File loaded successfully | Hash table replaced with snapshot contents |
+| `RDB_ERR_OPEN` | File not found or permission denied | Hash table unchanged |
+| `RDB_ERR_MAGIC` | Header mismatch (wrong file or corrupt) | Hash table freed and replaced with empty table |
+
+<Warning>
+  On `RDB_ERR_MAGIC`, `ht_load` has already called `ht_free` before detecting the bad header. The in-memory state is lost. Always keep a valid snapshot before attempting a `LOAD` on an untrusted file.
+</Warning>
+
+## TTL semantics in snapshots
+
+The `expires_at` field stored in each entry is an **absolute Unix timestamp**, not a duration. This means:
+
+- A key with `expires_at = 1748000000` will expire at that wall-clock time regardless of when the snapshot was taken or loaded.
+- If the snapshot was created while a key had 5 minutes remaining, and the snapshot is loaded 10 minutes later, that key is already expired at load time.
+- Expired keys are **not filtered out during `ht_load`**. They are inserted into the hash table with their original `expires_at`. The passive expiry in `ht_get` and the active sweeper in `expire_sweep` will remove them on next access or next sweep.
+
+<Tip>
+  If you are using snapshots to migrate data between two RadishDB instances, load the snapshot promptly after saving it to avoid TTL drift. Keys with very short TTLs may already be expired by the time the snapshot is loaded on the destination.
+</Tip>
+
+## Relationship to AOF
+
+Loading a snapshot does **not** affect the AOF. After a `LOAD`:
+
+- The in-memory state matches the snapshot.
+- The AOF still points to its existing file.
+- New `SET` and `DEL` commands continue to append to the AOF as normal.
+- The AOF and the in-memory state are now out of sync — the AOF contains the history from before the `LOAD`, not the snapshot contents.
+
+To bring the AOF back into sync with the snapshot state, trigger an AOF rewrite after the load. The rewrite serializes the current in-memory state (the snapshot contents) as the new baseline, discarding the pre-load history.
+
+```bash
+>>> LOAD mybackup
+OK
+# AOF is now out of sync — issue a rewrite
+# (Automatic on next REPL iteration if aof_size > aof_base_size * 2)
+```
+
+Alternatively, restart RadishDB. The startup sequence replays the AOF, which will replay the full pre-load history and any post-load mutations, arriving at the correct state.

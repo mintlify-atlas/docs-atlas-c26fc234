@@ -1,0 +1,93 @@
+---
+title: "BENCH"
+description: "Insert N key-value pairs for benchmarking and performance testing"
+---
+
+Insert a large number of sequentially-named key-value pairs and report how long the operation took. Useful for measuring write throughput and observing hash table resize behavior.
+
+## Syntax
+
+```bash
+BENCH n
+```
+
+## Parameters
+
+<ParamField path="n" type="integer" required>
+  The number of key-value pairs to insert. Must be greater than `0`.
+</ParamField>
+
+## Return value
+
+Returns a string describing the result:
+
+```
+Inserted <n> entries in <elapsed> seconds.
+```
+
+## Errors
+
+| Condition | Error message |
+|---|---|
+| Wrong number of arguments | `(error) wrong number of arguments for 'BENCH'` |
+| `n` is zero or negative | `(error) invalid number` |
+
+## Examples
+
+```bash
+>>> BENCH 100000
+Inserted 100000 entries in 0.04 seconds.
+
+>>> COUNT
+(integer) 100000
+```
+
+Smaller run to observe behavior:
+
+```bash
+>>> BENCH 5
+Inserted 5 entries in 0.00 seconds.
+
+>>> GET key0
+value0
+>>> GET key4
+value4
+```
+
+## Key and value naming
+
+`BENCH` inserts keys using a fixed pattern:
+
+| Index | Key | Value |
+|---|---|---|
+| 0 | `key0` | `value0` |
+| 1 | `key1` | `value1` |
+| … | … | … |
+| N-1 | `keyN-1` | `valueN-1` |
+
+All keys are inserted without a TTL (`expires_at = 0`).
+
+## Notes
+
+<Warning>
+  `BENCH` does **not** write to the AOF. The inserted keys exist in memory only and will not survive a process restart unless you run [`SAVE`](/reference/commands/save-load) immediately after. This is intentional — AOF writes would dominate the benchmark timing.
+</Warning>
+
+<Note>
+  Because `BENCH` inserts many keys rapidly, it is a good way to trigger hash table resizes. Monitor the `Resizes` and `Load Factor` fields in [`INFO`](/reference/commands/info) output before and after a large `BENCH` run to observe dynamic resizing.
+</Note>
+
+<Tip>
+  Run `BENCH` followed by `INFO` to get a full picture of hash table health at scale:
+
+  ```bash
+  >>> BENCH 50000
+  Inserted 50000 entries in 0.02 seconds.
+  >>> INFO
+  ...
+  Buckets : 65536
+  Load Factor : 0.762939
+  Resizes : 4
+  Max chain : 3
+  ```
+</Tip>

@@ -1,0 +1,419 @@
+---
+title: "HashTable API"
+description: "C API reference for the RadishDB hash table: creation, get, set, delete, and introspection"
+---
+
+The `hashtable` module is the core storage layer of RadishDB. It implements an open-addressing-style chained hash table with automatic resizing, TTL-aware lookups, and introspection utilities.
+
+## Data structures
+
+### `Entry`
+
+A single key-value record stored in the hash table.
+
+```c
+typedef struct Entry {
+  char *key;
+  char *value;
+  time_t expires_at;  // 0 = no expiry, otherwise absolute Unix timestamp
+  struct Entry *next;
+} Entry;
+```
+
+<ResponseField name="key" type="char *" required>
+  Heap-allocated string containing the entry's key.
+</ResponseField>
+
+<ResponseField name="value" type="char *" required>
+  Heap-allocated string containing the entry's value.
+</ResponseField>
+
+<ResponseField name="expires_at" type="time_t" required>
+  Absolute Unix timestamp after which the entry is considered expired. A value of `0` means the entry never expires.
+</ResponseField>
+
+<ResponseField name="next" type="struct Entry *" required>
+  Pointer to the next entry in the same bucket chain. `NULL` if this is the last entry.
+</ResponseField>
+
+---
+
+### `HashTable`
+
+The top-level hash table container.
+
+```c
+typedef struct HashTable {
+  Entry **buckets;
+  size_t size;    // number of buckets
+  int count;      // number of live entries
+  int resizes;    // number of times the table has been resized
+} HashTable;
+```
+
+<ResponseField name="buckets" type="Entry **" required>
+  Array of pointers to bucket chain heads. Length is `size`.
+</ResponseField>
+
+<ResponseField name="size" type="size_t" required>
+  Total number of buckets allocated.
+</ResponseField>
+
+<ResponseField name="count" type="int" required>
+  Number of live (non-expired) entries in the table.
+</ResponseField>
+
+<ResponseField name="resizes" type="int" required>
+  Cumulative count of resize operations performed on this table.
+</ResponseField>
+
+---
+
+### `Info`
+
+Snapshot of hash table statistics returned by `ht_info`.
+
+```c
+typedef struct Info {
+  int keys;
+  int keys_with_ttl;
+  int expired_keys;
+  int buckets;
+  float load_factor;
+  int max_chain;
+  int resizes;
+} Info;
+```
+
+<ResponseField name="keys" type="int">
+  Number of live keys currently in the table.
+</ResponseField>
+
+<ResponseField name="keys_with_ttl" type="int">
+  Number of live keys that have a non-zero `expires_at` value.
+</ResponseField>
+
+<ResponseField name="expired_keys" type="int">
+  Number of entries found during the scan that have already passed their expiry time.
+</ResponseField>
+
+<ResponseField name="buckets" type="int">
+  Total number of buckets in the table.
+</ResponseField>
+
+<ResponseField name="load_factor" type="float">
+  Ratio of live keys to total buckets (`keys / buckets`).
+</ResponseField>
+
+<ResponseField name="max_chain" type="int">
+  Length of the longest bucket chain found during the scan.
+</ResponseField>
+
+<ResponseField name="resizes" type="int">
+  Total number of resize operations performed on this table.
+</ResponseField>
+
+---
+
+## Functions
+
+### `ht_create`
+
+Allocates and initializes a new hash table.
+
+```c
+HashTable *ht_create(int size);
+```
+
+<ParamField path="size" type="int" required>
+  Initial number of buckets. Must be greater than `0`. Choose a power of two for best distribution.
+</ParamField>
+
+**Returns** a pointer to a newly allocated `HashTable`, or `NULL` if allocation fails. You are responsible for freeing this with `ht_free`.
+
+```c
+HashTable *ht = ht_create(64);
+if (!ht) {
+    fprintf(stderr, "Out of memory\n");
+    exit(1);
+}
+```
+
+---
+
+### `hash`
+
+Computes a hash value for a null-terminated string.
+
+```c
+unsigned long hash(const char *str);
+```
+
+<ParamField path="str" type="const char *" required>
+  Null-terminated string to hash.
+</ParamField>
+
+**Returns** an `unsigned long` hash value. The table internally uses this modulo `ht->size` to select a bucket.
+
+```c
+unsigned long h = hash("mykey");
+size_t bucket = h % ht->size;
+```
+
+<Note>
+  You rarely need to call `hash` directly. It is used internally by `ht_set`, `ht_get`, and `ht_delete`.
+</Note>
+
+---
+
+### `ht_set`
+
+Inserts or updates a key-value pair in the hash table.
+
+```c
+void ht_set(HashTable *ht, const char *key, const char *value, time_t expires_at);
+```
+
+<ParamField path="ht" type="HashTable *" required>
+  The hash table to write to.
+</ParamField>
+
+<ParamField path="key" type="const char *" required>
+  Null-terminated key string. The function makes an internal copy.
+</ParamField>
+
+<ParamField path="value" type="const char *" required>
+  Null-terminated value string. The function makes an internal copy.
+</ParamField>
+
+<ParamField path="expires_at" type="time_t" required>
+  Absolute Unix timestamp for expiry. Pass `0` for no expiry.
+</ParamField>
+
+If the key already exists, its value and `expires_at` are updated in-place. The table resizes automatically when the load factor exceeds the internal threshold.
+
+```c
+time_t now = time(NULL);
+
+// Set a key with no expiry
+ht_set(ht, "color", "red", 0);
+
+// Set a key that expires in 60 seconds
+ht_set(ht, "session", "abc123", now + 60);
+```
+
+---
+
+### `ht_get`
+
+Retrieves the value for a key.
+
+```c
+char *ht_get(HashTable *ht, const char *key);
+```
+
+<ParamField path="ht" type="HashTable *" required>
+  The hash table to read from.
+</ParamField>
+
+<ParamField path="key" type="const char *" required>
+  Null-terminated key string to look up.
+</ParamField>
+
+**Returns** a pointer to the stored value string, or `NULL` if the key is not found or has expired. Passive expiry: if the key is found but its `expires_at` is in the past, the entry is deleted before `NULL` is returned.
+
+<Warning>
+  Do not free or modify the returned pointer. It points directly into the hash table's internal storage.
+</Warning>
+
+```c
+char *val = ht_get(ht, "color");
+if (val) {
+    printf("color = %s\n", val);
+} else {
+    printf("key not found or expired\n");
+}
+```
+
+---
+
+### `ht_delete`
+
+Removes a key from the hash table.
+
+```c
+int ht_delete(HashTable *ht, const char *key);
+```
+
+<ParamField path="ht" type="HashTable *" required>
+  The hash table to delete from.
+</ParamField>
+
+<ParamField path="key" type="const char *" required>
+  Null-terminated key string to remove.
+</ParamField>
+
+**Returns** `1` if the key was found and deleted, `0` if the key was not found.
+
+```c
+int deleted = ht_delete(ht, "session");
+if (deleted) {
+    printf("key removed\n");
+} else {
+    printf("key did not exist\n");
+}
+```
+
+---
+
+### `ht_ttl`
+
+Returns the remaining time-to-live for a key in seconds.
+
+```c
+long ht_ttl(HashTable *ht, const char *key);
+```
+
+<ParamField path="ht" type="HashTable *" required>
+  The hash table to query.
+</ParamField>
+
+<ParamField path="key" type="const char *" required>
+  Null-terminated key string.
+</ParamField>
+
+**Returns** one of:
+
+| Value | Meaning |
+|---|---|
+| `-1` | Key exists and has no expiry (`expires_at == 0`) |
+| `-2` | Key not found, or key was found but already expired (passive delete occurs) |
+| `> 0` | Seconds remaining until expiry |
+
+```c
+ht_set(ht, "token", "xyz", time(NULL) + 120);
+
+long ttl = ht_ttl(ht, "token");
+if (ttl > 0) {
+    printf("expires in %ld seconds\n", ttl);
+} else if (ttl == -1) {
+    printf("no expiry set\n");
+} else {
+    printf("key not found\n");
+}
+```
+
+---
+
+### `ht_info`
+
+Scans the table and returns a point-in-time statistics snapshot.
+
+```c
+Info ht_info(HashTable *ht);
+```
+
+<ParamField path="ht" type="HashTable *" required>
+  The hash table to inspect.
+</ParamField>
+
+**Returns** an `Info` struct populated by a full table scan. The scan counts live keys, TTL keys, already-expired keys, the longest chain, and computes the load factor.
+
+<Note>
+  `ht_info` performs a full scan of all buckets. On very large tables this has O(n) cost proportional to `size + count`.
+</Note>
+
+```c
+Info info = ht_info(ht);
+printf("keys:        %d\n", info.keys);
+printf("keys w/ ttl: %d\n", info.keys_with_ttl);
+printf("expired:     %d\n", info.expired_keys);
+printf("load factor: %.2f\n", info.load_factor);
+printf("max chain:   %d\n", info.max_chain);
+printf("resizes:     %d\n", info.resizes);
+```
+
+---
+
+### `ht_resize`
+
+Rehashes the table into a new bucket array of the given size.
+
+```c
+void ht_resize(HashTable *ht, int new_size);
+```
+
+<ParamField path="ht" type="HashTable *" required>
+  The hash table to resize.
+</ParamField>
+
+<ParamField path="new_size" type="int" required>
+  New number of buckets. Should be a power of two.
+</ParamField>
+
+All existing entries are rehashed into the new bucket array. `ht->resizes` is incremented. The table calls this automatically when the load factor grows beyond the internal threshold, but you can trigger it manually to pre-size the table before a bulk insert.
+
+```c
+// Pre-size before inserting 1 000 000 entries
+ht_resize(ht, 1 << 20);
+```
+
+---
+
+### `ht_free`
+
+Frees all memory owned by the hash table, including all entries, keys, values, and the bucket array.
+
+```c
+void ht_free(HashTable *ht);
+```
+
+<ParamField path="ht" type="HashTable *" required>
+  The hash table to destroy. The pointer itself becomes invalid after this call.
+</ParamField>
+
+<Warning>
+  Do not access `ht` or any previously retrieved value pointers after calling `ht_free`.
+</Warning>
+
+```c
+ht_free(ht);
+ht = NULL;  // defensive: prevent use-after-free
+```
+
+---
+
+## Full example
+
+```c
+#include "hashtable.h"
+#include <stdio.h>
+#include <time.h>
+
+int main(void) {
+    HashTable *ht = ht_create(16);
+
+    // Insert entries
+    ht_set(ht, "name",    "radish",  0);
+    ht_set(ht, "version", "1.0",     0);
+    ht_set(ht, "token",   "secret",  time(NULL) + 30);
+
+    // Read
+    printf("%s\n", ht_get(ht, "name"));  // radish
+
+    // TTL
+    long ttl = ht_ttl(ht, "token");     // ~30
+    printf("token ttl: %ld\n", ttl);
+
+    // Inspect
+    Info info = ht_info(ht);
+    printf("load factor: %.2f\n", info.load_factor);
+
+    // Delete
+    ht_delete(ht, "version");
+
+    // Cleanup
+    ht_free(ht);
+    return 0;
+}
+```

@@ -1,0 +1,149 @@
+---
+title: "Expires API"
+description: "C API reference for RadishDB's active TTL expiration sweeper"
+---
+
+The `expires` module implements active TTL expiration for RadishDB. While passive expiration happens inside `ht_get` and `ht_ttl` when a specific key is accessed, the active sweeper proactively removes expired entries in the background, preventing unbounded memory growth for keys that are never read again.
+
+## How expiration works
+
+RadishDB uses a two-layer expiration strategy:
+
+| Layer | Where | Trigger |
+|---|---|---|
+| Passive | `ht_get`, `ht_ttl` | On each key access — expired keys are deleted before returning `NULL` or `-2` |
+| Active | `expire_sweep` | Called once per REPL/server loop iteration with `max_checks = 10` |
+
+The active sweeper advances a module-level cursor through the bucket array, checking up to `max_checks` entries per call. This amortizes the cost of expiration across many loop iterations rather than blocking on a full scan.
+
+<Warning>
+  The expiry cursor is module-level, not per-`HashTable`. Only one `HashTable` can use the active sweeper at a time. If you load a new table with `ht_load`, call `expire_init` to reset the cursor.
+</Warning>
+
+---
+
+## Functions
+
+### `expire_init`
+
+Resets the module-level expiry cursor to the start of the bucket array.
+
+```c
+void expire_init(HashTable *ht);
+```
+
+<ParamField path="ht" type="HashTable *" required>
+  The hash table the sweeper will operate on. Used to bound the cursor reset.
+</ParamField>
+
+Call this at startup and immediately after every `ht_load` call. If you skip it after loading a snapshot, the cursor may point past the end of the new (potentially smaller) bucket array, causing undefined behavior.
+
+```c
+// At startup
+expire_init(ht);
+
+// After loading a snapshot
+RdbStatus st = ht_load(&ht, "data.rdbx");
+if (st == RDB_OK) {
+    expire_init(ht);  // always reset after load
+}
+```
+
+---
+
+### `expire_sweep`
+
+Advances the cursor and deletes any expired entries it encounters.
+
+```c
+void expire_sweep(HashTable *ht, size_t max_checks);
+```
+
+<ParamField path="ht" type="HashTable *" required>
+  The hash table to sweep.
+</ParamField>
+
+<ParamField path="max_checks" type="size_t" required>
+  Maximum number of entries to examine in this call. The engine calls this with `10` on each loop iteration.
+</ParamField>
+
+#### Sweep behavior
+
+- Starts at the current cursor position and advances through buckets.
+- For each entry: if `expires_at != 0 && expires_at <= time(NULL)`, the entry is deleted immediately (key, value, and `Entry` struct are freed).
+- After examining `max_checks` entries, the sweep stops and the cursor position is saved for the next call.
+- The cursor wraps around to bucket `0` after reaching the end of the array.
+
+<Note>
+  Entries with `expires_at == 0` are never deleted by the sweeper — they have no expiry.
+</Note>
+
+```c
+// Typical main loop
+while (1) {
+    // ... read and execute command ...
+
+    expire_sweep(ht, 10);
+}
+```
+
+---
+
+## Full usage example
+
+```c
+#include "expires.h"
+#include "hashtable.h"
+#include "persistence.h"
+#include <stdio.h>
+#include <time.h>
+
+int main(void) {
+    HashTable *ht = ht_create(64);
+
+    // Initialize sweeper at startup
+    expire_init(ht);
+
+    // Insert some entries with TTL
+    ht_set(ht, "a", "1", time(NULL) + 1);  // expires in 1 second
+    ht_set(ht, "b", "2", time(NULL) + 60); // expires in 60 seconds
+    ht_set(ht, "c", "3", 0);               // never expires
+
+    // Simulate main loop
+    for (int i = 0; i < 100; i++) {
+        // ... process commands ...
+        expire_sweep(ht, 10);
+    }
+
+    // After ht_load, always reset
+    RdbStatus st = ht_load(&ht, "snapshot.rdbx");
+    if (st == RDB_OK) {
+        expire_init(ht);
+    }
+
+    ht_free(ht);
+    return 0;
+}
+```
+
+---
+
+## Integration with `ht_load` and `ht_save`
+
+The expiry cursor is not serialized into `.rdbx` snapshots. After restoring from a snapshot, the cursor is in whatever state it was left in from the previous table, which is invalid for the new table. Always pair `ht_load` with `expire_init`:
+
+```c
+// Startup sequence
+HashTable *ht = ht_create(64);
+
+RdbStatus st = ht_load(&ht, "data.rdbx");
+if (st == RDB_OK) {
+    expire_init(ht);       // reset cursor for the loaded table
+} else {
+    expire_init(ht);       // reset cursor for the fresh table
+}
+
+// Then replay AOF on top
+aof_open("aof/radish.aof");
+aof_replay(ht, "aof/radish.aof");
+```

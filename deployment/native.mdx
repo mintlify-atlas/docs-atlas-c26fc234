@@ -1,0 +1,148 @@
+---
+title: "Native build"
+description: "Build and run RadishDB from source"
+---
+
+Building RadishDB from source gives you a binary you can run directly on the host, instrument with address sanitizers, or embed in another project.
+
+## Prerequisites
+
+- **GCC 13+** (or a compatible C compiler such as Clang)
+- **GNU Make**
+- A **POSIX-compatible system** (Linux or macOS)
+
+Verify your toolchain:
+
+```bash
+gcc --version
+make --version
+```
+
+## Build steps
+
+<Steps>
+  <Step title="Clone the repository">
+    ```bash
+    git clone https://github.com/pie-314/RadishDB.git
+    cd RadishDB
+    ```
+  </Step>
+
+  <Step title="Build the binary">
+    ```bash
+    make
+    ```
+
+    The Makefile compiles the following source files with `-Wall -Wextra -Werror -g`:
+
+    ```
+    src/main.c
+    src/hashtable.c
+    src/persistence.c
+    src/aof.c
+    src/expires.c
+    src/utils.c
+    src/engine.c
+    src/repl.c
+    src/result.c
+    src/server.c
+    ```
+
+    The output binary is `radishdb` in the project root.
+  </Step>
+
+  <Step title="Create the AOF directory">
+    RadishDB writes its append-only log to `aof/radish.aof`. Create the directory before the first run:
+
+    ```bash
+    mkdir -p aof
+    ```
+
+    <Warning>
+      The `aof/` directory must exist before you start RadishDB. If it is missing, the engine cannot open the log file and will fail on startup. This step is required every time you start fresh from a clean clone.
+    </Warning>
+  </Step>
+
+  <Step title="Start RadishDB">
+    Choose the mode that suits your use case:
+
+    ```bash
+    # TCP server mode — listens on 0.0.0.0:6379
+    ./radishdb --server
+
+    # Interactive REPL — local terminal session
+    ./radishdb
+    ```
+  </Step>
+</Steps>
+
+## Running modes
+
+### REPL mode
+
+Running `./radishdb` without flags launches the interactive REPL:
+
+```bash
+./radishdb
+```
+
+The screen clears and you get a prompt. All commands are available, plus `CLEAR` to clear the terminal. Type `EXIT` or `QUIT` to stop.
+
+### Server mode
+
+Running `./radishdb --server` binds to `0.0.0.0:6379` and waits for a single TCP client connection:
+
+```bash
+./radishdb --server
+```
+
+Connect from another terminal:
+
+```bash
+nc localhost 6379
+```
+
+The server reads commands line by line, executes them against the shared hash table, and sends responses back. It also runs an expiry sweep every 10 iterations to clear out TTL-expired keys.
+
+## CLI flags
+
+| Flag | Short | Description |
+|---|---|---|
+| `--server` | `-s` | Start in TCP server mode on port 6379 |
+| `--version` | `-v` | Print version (`0.1`) and exit |
+| `--help` | `-h` | Print usage information and exit |
+
+Examples:
+
+```bash
+./radishdb --version
+# version 0.1
+
+./radishdb --help
+```
+
+## Build with address sanitizer
+
+For debugging memory errors, build with AddressSanitizer enabled:
+
+```bash
+make asan
+```
+
+This compiles with `-fsanitize=address`, which instruments every memory access. Run the resulting binary normally — ASAN prints a detailed report and aborts on any heap overflow, use-after-free, or memory leak.
+
+```bash
+./radishdb --server
+```
+
+<Note>
+  ASAN builds are significantly slower than release builds and should not be used in production. Use them during development to catch memory bugs early.
+</Note>
+
+## Clean build artifacts
+
+Remove the compiled binary and any intermediate build files:
+
+```bash
+make clean
+```

@@ -1,0 +1,137 @@
+---
+title: "Storage engine"
+description: "How RadishDB stores keys and values in memory using a hash table"
+---
+
+All data in RadishDB lives in a single in-memory hash table. The hash table uses **separate chaining** to resolve collisions and automatically resizes when it grows too dense. Every key and value is a heap-allocated C string; the hash table owns these allocations.
+
+## Data structures
+
+### Entry
+
+Each key-value pair is stored in an `Entry` node:
+
+```c hashtable.h
+typedef struct Entry {
+  char    *key;         // heap-allocated (strdup)
+  char    *value;       // heap-allocated (strdup)
+  time_t   expires_at;  // 0 = no expiry, otherwise Unix timestamp
+  struct Entry *next;   // next entry in the same bucket (chaining)
+} Entry;
+```
+
+`expires_at == 0` is the sentinel for "this key never expires". Any non-zero value is an absolute Unix timestamp; the key is considered expired once `time(NULL) >= expires_at`.
+
+### HashTable
+
+```c hashtable.h
+typedef struct HashTable {
+  Entry  **buckets;  // array of Entry* pointers
+  size_t   size;     // number of buckets (always a power of two)
+  int      count;    // number of live entries
+  int      resizes;  // total number of resize operations performed
+} HashTable;
+```
+
+The `size` field tracks the bucket array length. `count` tracks live entries and drives the load factor calculation. `resizes` is a monotonic counter exposed by the `INFO` command.
+
+## Hash function
+
+RadishDB uses a djb2 variant — a multiply-and-add hash that distributes ASCII keys well in practice:
+
+```c hashtable.c
+unsigned long hash(const char *str) {
+  unsigned long hash = 5381;
+  for (int i = 0; str[i] != '\0'; i++) {
+    hash = hash * 33 + str[i];
+  }
+  return hash;
+}
+```
+
+The bucket index is `hash(key) % ht->size`. Because `size` is always a power of two after the first resize, this modulo is computed efficiently.
+
+<Note>
+  djb2 is not cryptographic. Key distribution is good for typical workloads, but a carefully crafted set of keys can cause hash collisions. RadishDB does not implement hash randomization.
+</Note>
+
+## Separate chaining
+
+When two keys map to the same bucket, they form a singly-linked list through the `next` pointer. Lookup walks the chain comparing keys with `strcmp` until it finds a match or reaches the end.
+
+```
+buckets[i] → Entry{"apple", "red",  0, →} → Entry{"ant", "6", 0, NULL}
+buckets[j] → Entry{"banana", "yellow", 1700000000, NULL}
+buckets[k] → NULL
+```
+
+In the average case — low load, few collisions — lookup is O(1). Worst case is O(n) if all keys hash to the same bucket, but this does not occur in practice because of the load factor threshold.
+
+## Auto-resize at 0.75 load factor
+
+Before every insert, `ht_set` computes the current load factor:
+
+```c hashtable.c
+void ht_set(HashTable *ht, const char *key, const char *value, time_t expires_at) {
+  float load = (float)ht->count / ht->size;
+  if (load > 0.75f) {
+    ht_resize(ht, ht->size * 2);  // double the bucket count
+  }
+  // ... insert with separate chaining
+}
+```
+
+When the load factor exceeds 0.75, `ht_resize` allocates a new bucket array twice as large, re-hashes every existing entry into the new array, and frees the old array. The `resizes` counter increments with each operation.
+
+This keeps the average chain length short (below 1.0) and lookup time close to O(1) regardless of database size.
+
+## Memory management
+
+All strings are heap-allocated via `strdup` at insert time. The hash table owns these allocations:
+
+- On `SET`: new `key` and `value` strings are `strdup`'d into the entry.
+- On overwrite: the old `value` string is `free`'d before the new one is stored.
+- On `DEL` or expiry: both `key` and `value` are `free`'d and the `Entry` itself is `free`'d.
+- On `ht_resize`: entries are re-linked into new buckets — the strings themselves are **not** re-allocated.
+
+<Warning>
+  Callers must never hold a raw pointer to a value string across a `SET` or `DEL` that targets the same key. The underlying allocation may be freed.
+</Warning>
+
+## Complexity
+
+| Operation | Average | Worst case |
+|-----------|---------|------------|
+| `SET`     | O(1) amortized | O(n) during resize |
+| `GET`     | O(1)    | O(n) — full chain scan |
+| `DEL`     | O(1)    | O(n) — full chain scan |
+| `TTL`     | O(1)    | O(n) — full chain scan |
+| Resize    | O(n)    | O(n)       |
+
+Amortized O(1) for `SET` holds because resize work is spread across many insertions. Resize itself is O(n) but happens at most O(log n) times over n total inserts.
+
+## INFO metrics
+
+The `INFO` command exposes the following hash table statistics:
+
+| Field | Description |
+|-------|-------------|
+| `keys` | Total number of live entries |
+| `keys_with_ttl` | Entries that have a non-zero `expires_at` |
+| `expired_keys` | Cumulative count of keys deleted by expiry |
+| `buckets` | Current bucket array size |
+| `load_factor` | `count / size` as a float |
+| `resizes` | Total number of resize operations |
+| `max_chain` | Length of the longest chain in the current table |
+
+```bash
+>>> INFO
+keys:12
+keys_with_ttl:3
+expired_keys:7
+buckets:16
+load_factor:0.75
+resizes:2
+max_chain:2
+uptime_seconds:142
+```

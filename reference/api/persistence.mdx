@@ -1,0 +1,143 @@
+---
+title: "Persistence API"
+description: "C API reference for RadishDB's binary snapshot (.rdbx) save and load"
+---
+
+The `persistence` module provides point-in-time binary snapshots of the hash table. A snapshot captures all live key-value pairs — including their expiry timestamps — in a compact binary format with an `RDBX` magic header. Snapshots complement the AOF log: while the AOF provides durability for individual mutations, snapshots provide faster full restores.
+
+## Data structures
+
+### `RdbStatus`
+
+Status codes returned by `ht_load`.
+
+```c
+typedef enum {
+  RDB_OK = 1,
+  RDB_ERR_OPEN,   // fopen failed
+  RDB_ERR_MAGIC,  // wrong RDBX header
+} RdbStatus;
+```
+
+| Variant | Value | Meaning |
+|---|---|---|
+| `RDB_OK` | `1` | Snapshot loaded successfully. |
+| `RDB_ERR_OPEN` | `2` | `fopen` failed — file not found or permission denied. |
+| `RDB_ERR_MAGIC` | `3` | The file does not begin with the expected `RDBX` magic bytes. |
+
+---
+
+## Functions
+
+### `ht_save`
+
+Writes the current hash table to a binary snapshot file.
+
+```c
+int ht_save(HashTable *ht, const char *filename);
+```
+
+<ParamField path="ht" type="HashTable *" required>
+  The hash table to snapshot.
+</ParamField>
+
+<ParamField path="filename" type="const char *" required>
+  Destination file path. Convention is to use the `.rdbx` extension, but the API does not enforce it. The engine's `SAVE` command appends `.rdbx` automatically; direct API callers must include it themselves.
+</ParamField>
+
+**Returns** `1` on success, `0` on failure (e.g. if the file cannot be opened for writing).
+
+```c
+if (!ht_save(ht, "backup.rdbx")) {
+    fprintf(stderr, "Save failed\n");
+}
+```
+
+---
+
+### `ht_load`
+
+Loads a binary snapshot file into a hash table, replacing the existing one.
+
+```c
+int ht_load(HashTable **ht, const char *filename);
+```
+
+<ParamField path="ht" type="HashTable **" required>
+  Pointer to the hash table pointer. `ht_load` frees the old table and replaces `*ht` with a freshly allocated one populated from the snapshot.
+</ParamField>
+
+<ParamField path="filename" type="const char *" required>
+  Path to the `.rdbx` snapshot file to load.
+</ParamField>
+
+**Returns** an `RdbStatus` value:
+
+| Return value | Condition |
+|---|---|
+| `RDB_OK` | File opened and all entries loaded. |
+| `RDB_ERR_OPEN` | File could not be opened. |
+| `RDB_ERR_MAGIC` | File header does not match `RDBX`. |
+
+<Warning>
+  Always call `expire_init(ht)` immediately after a successful `ht_load`. The expiry cursor is module-level and is not persisted in the snapshot; skipping this call leaves the cursor in an invalid state.
+</Warning>
+
+```c
+RdbStatus st = ht_load(&ht, "backup.rdbx");
+switch (st) {
+    case RDB_OK:
+        expire_init(ht);  // always call after load
+        break;
+    case RDB_ERR_OPEN:
+        fprintf(stderr, "File not found\n");
+        break;
+    case RDB_ERR_MAGIC:
+        fprintf(stderr, "Invalid .rdbx file\n");
+        break;
+}
+```
+
+---
+
+## Full example
+
+```c
+#include "persistence.h"
+#include "expires.h"
+#include "hashtable.h"
+#include <stdio.h>
+
+int main(void) {
+    HashTable *ht = ht_create(64);
+
+    ht_set(ht, "name",  "radish", 0);
+    ht_set(ht, "color", "red",    0);
+
+    // Save snapshot
+    if (!ht_save(ht, "data.rdbx")) {
+        fprintf(stderr, "ht_save failed\n");
+        return 1;
+    }
+
+    // Load snapshot (replaces ht in-place)
+    RdbStatus st = ht_load(&ht, "data.rdbx");
+    if (st == RDB_OK) {
+        expire_init(ht);  // reset expiry cursor after load
+        printf("%s\n", ht_get(ht, "name"));  // radish
+    } else if (st == RDB_ERR_OPEN) {
+        fprintf(stderr, "Could not open data.rdbx\n");
+    } else if (st == RDB_ERR_MAGIC) {
+        fprintf(stderr, "data.rdbx is not a valid snapshot\n");
+    }
+
+    ht_free(ht);
+    return 0;
+}
+```
+
+## Notes
+
+- The `.rdbx` extension is a convention, not enforced by the API. The engine's `SAVE` command appends it automatically; direct API callers must include it in the filename.
+- `ht_load` takes `HashTable **` and replaces the pointed-to pointer. The old table is freed inside the function.
+- Snapshots do not replace the AOF. On startup, load the snapshot first, then replay the AOF to recover mutations written after the last snapshot.
