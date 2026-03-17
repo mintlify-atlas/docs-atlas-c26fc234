@@ -9,7 +9,7 @@ The `engine` module parses and executes RadishDB commands against a `HashTable`.
 
 ### `ResultType`
 
-Disciminant tag for the `Result` union.
+Discriminant tag for the `Result` union.
 
 ```c
 typedef enum {
@@ -170,6 +170,44 @@ void free_result(Result *r) {
 
 ---
 
+### `print_result`
+
+Formats and writes a `Result` to a `FILE *` output stream.
+
+```c
+void print_result(FILE *out, Result *r);
+```
+
+<ParamField path="out" type="FILE *" required>
+  Output file pointer — `stdout` for the REPL, a client socket file pointer for the TCP server.
+</ParamField>
+
+<ParamField path="r" type="Result *" required>
+  The result to print. Each type is formatted as follows:
+
+  | `ResultType` | Output |
+  |---|---|
+  | `RES_STRING` | The string followed by `\n` |
+  | `RES_ERROR` | The error message followed by `\n` |
+  | `RES_OK` | `OK\n` |
+  | `RES_INTEGER` | The integer as `%ld\n` |
+  | `RES_NIL` | `(nil)\n` |
+  | `RES_CLEAN` | No output (REPL clears screen separately) |
+  | `RES_EXIT` | No output |
+</ParamField>
+
+<Note>
+  `print_result` does not call `free_result`. You must call `free_result` separately after printing.
+</Note>
+
+```c
+Result r = execute_command(ht, line);
+print_result(stdout, &r);
+free_result(&r);
+```
+
+---
+
 ## Full example
 
 ```c
@@ -203,6 +241,45 @@ int main(void) {
     printf("TTL: %ld\n", r3.value.integer);
     free_result(&r3);
 
+    ht_free(ht);
+    return 0;
+}
+```
+
+---
+
+## Server frontend
+
+### `start_server`
+
+Starts the TCP server, binds to port 6379, and enters the command processing loop.
+
+```c
+void start_server(HashTable *ht);
+```
+
+<ParamField path="ht" type="HashTable *" required>
+  The hash table the server operates on. All commands received over TCP are executed against this table.
+</ParamField>
+
+The server:
+- Binds to `0.0.0.0:6379`
+- Accepts one client connection at a time (`listen` backlog of 1)
+- Reads commands line by line from the client socket
+- Calls `execute_command` and `print_result` for each line
+- Calls `expire_sweep(ht, 10)` on every iteration
+- Exits when the client disconnects
+
+This function does not return until the client disconnects. Declared in `server.h`.
+
+```c
+#include "server.h"
+#include "hashtable.h"
+
+int main(void) {
+    HashTable *ht = ht_create(8);
+    // ... open AOF, replay, etc.
+    start_server(ht);  // blocks until client disconnects
     ht_free(ht);
     return 0;
 }

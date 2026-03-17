@@ -3,7 +3,7 @@ title: "HashTable API"
 description: "C API reference for the RadishDB hash table: creation, get, set, delete, and introspection"
 ---
 
-The `hashtable` module is the core storage layer of RadishDB. It implements an open-addressing-style chained hash table with automatic resizing, TTL-aware lookups, and introspection utilities.
+The `hashtable` module is the core storage layer of RadishDB. It implements a chained hash table with separate chaining for collision resolution, automatic resizing, TTL-aware lookups, and introspection utilities.
 
 ## Data structures
 
@@ -288,7 +288,7 @@ long ht_ttl(HashTable *ht, const char *key);
 |---|---|
 | `-1` | Key exists and has no expiry (`expires_at == 0`) |
 | `-2` | Key not found, or key was found but already expired (passive delete occurs) |
-| `> 0` | Seconds remaining until expiry |
+| `N > 0` | Seconds remaining until expiry |
 
 ```c
 ht_set(ht, "token", "xyz", time(NULL) + 120);

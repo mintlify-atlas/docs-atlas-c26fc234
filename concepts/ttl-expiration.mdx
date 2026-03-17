@@ -75,14 +75,14 @@ while (1) {
 
 The cursor advances by 10 entries per command. For a database with 1,000 entries, the entire table is scanned approximately every 100 commands. Expired keys are deleted and their memory is freed immediately.
 
-<Columns cols={2}>
+<CardGroup cols={2}>
   <Card title="Passive expiry" icon="eye">
     Triggered on `GET` and `TTL`. Instant — the key is gone the moment you try to read it after its deadline.
   </Card>
   <Card title="Active expiry" icon="rotate">
     Triggered on every command. Scans 10 entries per command cycle, advancing a cursor that wraps around the full table.
   </Card>
-</Columns>
+</CardGroup>
 
 ## TTL query semantics
 

@@ -17,7 +17,7 @@ None.
 
 ## Return value
 
-Returns `(integer) N`, where N is the number of keys currently tracked by the hash table.
+Returns `N`, where N is the number of keys currently tracked by the hash table.
 
 ## Examples
 
@@ -27,19 +27,19 @@ OK
 >>> SET b 2
 OK
 >>> COUNT
-(integer) 2
+2
 
 >>> DEL a
-(integer) 1
+1
 >>> COUNT
-(integer) 1
+1
 ```
 
 ```bash
 >>> BENCH 5
 Inserted 5 entries in 0.00 seconds.
 >>> COUNT
-(integer) 5
+5
 ```
 
 ## Notes

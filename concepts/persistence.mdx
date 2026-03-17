@@ -43,11 +43,11 @@ The AOF lives at `aof/radish.aof` relative to the working directory. In the Dock
 
 ```bash
 # Native
-./radishdb server
+./radishdb --server
 # → writes to ./aof/radish.aof
 
 # Docker
-docker run -v radish-data:/app/aof pie314/radishdb
+docker run -v radish-data:/app/aof piee314/radishdb
 # → writes to /app/aof/radish.aof (inside the volume)
 ```
 

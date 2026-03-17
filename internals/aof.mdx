@@ -14,7 +14,7 @@ The AOF lives at `aof/radish.aof` relative to the working directory. The `aof/` 
 ```bash
 # Create the directory before starting RadishDB
 mkdir -p aof
-./radishdb server
+./radishdb --server
 ```
 
 If the file does not exist, `aof_replay` treats that as a clean start and returns without error. The file is created on the first write.
@@ -180,12 +180,13 @@ On the very first run, no AOF file exists:
 
 1. `aof_replay` is called with `"aof/radish.aof"` — the file is not found, replay returns immediately.
 2. The in-memory hash table starts empty.
-3. `aof_open` is called — this creates the file.
-4. The first `SET` command triggers `aof_append_set`, which writes the `AOFX1` header implicitly via the rewrite path, or appends directly if this is a fresh file.
+3. `aof_open` is called — this creates the file in `"ab+"` mode.
+4. Mutations are appended directly as length-prefixed records. No `AOFX1` header is written on a fresh file — the header is only added by `aof_rewrite` during compaction.
+5. On the next startup rewrite (triggered when `aof_size > aof_base_size * 2` or `aof_base_size == 0`), `aof_rewrite` produces a new file with the `AOFX1` header.
 
 No configuration is required. The AOF bootstraps itself on first use.
 
-<Columns cols={2}>
+<CardGroup cols={2}>
   <Card title="Durability" icon="shield-check">
     Every write is fsynced before the command returns. A process kill or power loss after any successful command loses zero data.
   </Card>
@@ -198,4 +199,4 @@ No configuration is required. The AOF bootstraps itself on first use.
   <Card title="Format compatibility" icon="file-check">
     The AOFX1 magic header allows the format to evolve. Old files without the header are replayed in legacy mode without data loss.
   </Card>
-</Columns>
+</CardGroup>

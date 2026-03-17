@@ -39,7 +39,7 @@ Returns `OK` on success.
 | Condition | Error message |
 |---|---|
 | Wrong number of arguments | `(error) wrong number of arguments for 'SET'` |
-| `seconds` is negative | No response — the command is silently ignored |
+| `seconds` is negative | Returns `(nil)` — the `EX` clause is rejected and no key is written |
 
 ## Examples
 

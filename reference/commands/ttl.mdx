@@ -21,9 +21,9 @@ TTL key
 
 | Return value | Meaning |
 |---|---|
-| `(integer) N` (positive) | Key exists and will expire in N seconds |
-| `(integer) -1` | Key exists but has no expiration |
-| `(integer) -2` | Key does not exist or has already expired |
+| `N` (positive integer) | Key exists and will expire in N seconds |
+| `-1` | Key exists but has no expiration |
+| `-2` | Key does not exist or has already expired |
 
 ## Examples
 
@@ -31,15 +31,15 @@ TTL key
 >>> SET color red EX 60
 OK
 >>> TTL color
-(integer) 57
+57
 
 >>> SET name radish
 OK
 >>> TTL name
-(integer) -1
+-1
 
 >>> TTL missing
-(integer) -2
+-2
 ```
 
 Checking a key after it expires:
@@ -48,11 +48,11 @@ Checking a key after it expires:
 >>> SET temp hello EX 2
 OK
 >>> TTL temp
-(integer) 1
+1
 
 # (after 2 seconds)
 >>> TTL temp
-(integer) -2
+-2
 ```
 
 ## Notes
@@ -62,5 +62,5 @@ OK
 </Note>
 
 <Info>
-  Use [`SET`](/reference/commands/set) with the `EX` option to assign or update a key's TTL. There is no `EXPIRE` command in RadishDB.
+  Use [`SET`](/reference/commands/set) with the `EX` option to assign or update a key's TTL. There is no standalone `EXPIRE` command in RadishDB.
 </Info>

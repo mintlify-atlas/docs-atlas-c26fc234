@@ -56,7 +56,7 @@ RadishDB is a Redis-inspired in-memory key-value store written in C. This guide 
         2
         ```
 
-        `TTL` returns the remaining seconds until expiry. Once a key expires, `GET` returns an empty response.
+        `TTL` returns the remaining seconds until expiry (as a plain integer). Once a key expires, `GET` returns `(nil)`.
       </Step>
 
       <Step title="Verify persistence after restart">
@@ -138,6 +138,8 @@ RadishDB is a Redis-inspired in-memory key-value store written in C. This guide 
         TTL color
         7
         ```
+
+        TTL returns the remaining seconds as a plain integer.
       </Step>
     </Steps>
   </Tab>
@@ -145,7 +147,7 @@ RadishDB is a Redis-inspired in-memory key-value store written in C. This guide 
 
 ## What to explore next
 
-<Columns cols={2}>
+<CardGroup cols={2}>
   <Card title="Docker Compose" icon="layer-group" href="/deployment/docker-compose">
     Run RadishDB as a managed service with automatic restarts and named volumes.
   </Card>
@@ -158,4 +160,4 @@ RadishDB is a Redis-inspired in-memory key-value store written in C. This guide 
   <Card title="Architecture" icon="diagram-project" href="/concepts/architecture">
     See how the engine, REPL, and TCP server fit together.
   </Card>
-</Columns>
+</CardGroup>

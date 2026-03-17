@@ -19,7 +19,7 @@ DEL key
 
 ## Return value
 
-Returns `(integer) 1` if the key was found and deleted, or `(nil)` if the key did not exist.
+Returns `1` if the key was found and deleted, or `(nil)` if the key did not exist.
 
 ## Errors
 
@@ -33,7 +33,7 @@ Returns `(integer) 1` if the key was found and deleted, or `(nil)` if the key di
 >>> SET name radish
 OK
 >>> DEL name
-(integer) 1
+1
 
 >>> DEL name
 (nil)
@@ -48,11 +48,11 @@ Deleting a key that has a TTL:
 >>> SET session abc123 EX 3600
 OK
 >>> TTL session
-(integer) 3598
+3598
 >>> DEL session
-(integer) 1
+1
 >>> TTL session
-(integer) -2
+-2
 ```
 
 ## Notes

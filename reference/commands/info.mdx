@@ -122,3 +122,36 @@ Max chain : 4
 <Info>
   `INFO` is read-only and has no side effects. It does not trigger expiry sweeps or modify any state.
 </Info>
+
+---
+
+## Other utility commands
+
+These commands have no additional parameters and are self-explanatory.
+
+### HELP
+
+Prints the full list of supported commands with brief descriptions.
+
+```bash
+>>> HELP
+```
+
+### EXIT / QUIT
+
+Terminates the current session. In REPL mode, the process exits cleanly. In TCP server mode, the connection is closed.
+
+```bash
+>>> EXIT
+Bye!
+```
+
+`QUIT` is an alias for `EXIT`.
+
+### CLEAR
+
+Clears the terminal screen. Available in REPL mode only.
+
+```bash
+>>> CLEAR
+```

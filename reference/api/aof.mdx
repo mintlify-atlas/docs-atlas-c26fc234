@@ -221,7 +221,7 @@ aof_append_set("name",  "radish", NULL);   // no TTL
 aof_append_set("color", "red",    "30");   // 30-second TTL
 aof_append_del("name");
 
-// Compaction (e.g. triggered by BGREWRITE command)
+// Compaction (triggered automatically when aof_size > aof_base_size * 2)
 aof_rewrite(ht, "aof/radish.aof");
 
 // Shutdown

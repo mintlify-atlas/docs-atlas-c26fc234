@@ -27,7 +27,7 @@ SET counter 1003
 
 One record. Same result. Compaction does not change what the database contains â€” it changes how long it takes to reconstruct it from the log.
 
-<Columns cols={2}>
+<CardGroup cols={2}>
   <Card title="Bounded disk usage" icon="hard-drive">
     The AOF cannot grow without limit. After compaction, file size is proportional to the number of live keys, not the total write volume.
   </Card>
@@ -40,7 +40,7 @@ One record. Same result. Compaction does not change what the database contains â
   <Card title="Crash safety" icon="shield">
     The rewrite is atomic: it writes to a `.tmp` file first, then renames into place. A crash during rewrite leaves the old AOF intact.
   </Card>
-</Columns>
+</CardGroup>
 
 ## The rewrite algorithm
 

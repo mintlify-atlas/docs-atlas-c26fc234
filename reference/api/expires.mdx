@@ -81,9 +81,8 @@ void expire_sweep(HashTable *ht, size_t max_checks);
 ```c
 // Typical main loop
 while (1) {
+    expire_sweep(ht, 10);  // sweep before each command
     // ... read and execute command ...
-
-    expire_sweep(ht, 10);
 }
 ```
 

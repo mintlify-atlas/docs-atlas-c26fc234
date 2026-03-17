@@ -72,7 +72,7 @@ typedef struct Result {
 Each frontend calls `print_result(fp, &r)` to serialize the result to its output stream — stdout for the REPL, the client socket for the TCP server. After printing, it calls `free_result(&r)` to release any heap-allocated string.
 
 <Note>
-  `RES_CLEAN` is returned by commands that have no user-visible output (for example, internal housekeeping). Frontends skip printing for this type.
+  `RES_CLEAN` is returned specifically by the `CLEAR` command to signal the REPL to clear the terminal screen (`system("clear")`). The TCP server ignores this result type. `RES_EXIT` is returned by `EXIT` and `QUIT` to signal the frontend to shut down.
 </Note>
 
 ## Two frontends, one engine
@@ -119,9 +119,9 @@ Both frontends follow the identical pattern: sweep, read, execute, print, free.
 
 ## Single-threaded design
 
-RadishDB is deliberately single-threaded. One goroutine — or rather, one OS thread — handles everything: the event loop, command execution, expiry sweeping, and I/O.
+RadishDB is deliberately single-threaded. One OS thread handles everything: the event loop, command execution, expiry sweeping, and I/O.
 
-<Columns cols={2}>
+<CardGroup cols={2}>
   <Card title="Simplicity" icon="circle-check">
     No mutexes, no lock ordering, no data races. The entire state of the database is owned by a single thread at all times.
   </Card>
@@ -134,7 +134,7 @@ RadishDB is deliberately single-threaded. One goroutine — or rather, one OS th
   <Card title="Auditability" icon="magnifying-glass">
     The execution path for any command can be traced linearly through the source. There are no concurrency-related control flows to reason about.
   </Card>
-</Columns>
+</CardGroup>
 
 This is the same trade-off Redis made in its original design: accept that one thread processes one command at a time in exchange for a dramatically simpler implementation.
 
