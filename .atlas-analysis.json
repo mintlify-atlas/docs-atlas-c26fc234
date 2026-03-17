@@ -1,0 +1,115 @@
+{
+  "projectType": "data-platform",
+  "projectName": "RadishDB",
+  "projectDescription": "A Redis-inspired in-memory key-value database written in C, featuring write-ahead logging, crash recovery, TTL expiration, AOF log compaction, a REPL, and a TCP server.",
+  "theme": "aspen",
+  "primaryColor": "#C0392B",
+  "lightColor": "#E74C3C",
+  "darkColor": "#922B21",
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Get Started",
+            "pages": ["introduction", "quickstart"]
+          },
+          {
+            "group": "Deployment",
+            "pages": ["deployment/docker", "deployment/docker-compose", "deployment/native"]
+          },
+          {
+            "group": "Core Concepts",
+            "pages": [
+              "concepts/architecture",
+              "concepts/storage-engine",
+              "concepts/persistence",
+              "concepts/ttl-expiration",
+              "concepts/crash-recovery"
+            ]
+          },
+          {
+            "group": "Internals",
+            "pages": [
+              "internals/hashtable",
+              "internals/aof",
+              "internals/snapshots",
+              "internals/log-compaction"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "Reference",
+        "groups": [
+          {
+            "group": "Command Reference",
+            "pages": [
+              "reference/commands/set",
+              "reference/commands/get",
+              "reference/commands/del",
+              "reference/commands/ttl",
+              "reference/commands/count",
+              "reference/commands/save-load",
+              "reference/commands/bench",
+              "reference/commands/info"
+            ]
+          },
+          {
+            "group": "C API",
+            "pages": [
+              "reference/api/hashtable",
+              "reference/api/engine",
+              "reference/api/aof",
+              "reference/api/persistence",
+              "reference/api/expires"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "In-memory key-value storage with hash table and separate chaining",
+    "Write-ahead logging (AOF) for crash-safe durability",
+    "Crash recovery via deterministic AOF replay",
+    "Per-key TTL expiration with passive and active sweeping",
+    "Binary snapshot persistence (.rdbx format)",
+    "AOF rewrite (log compaction) for bounded disk usage",
+    "Interactive REPL mode for local use",
+    "TCP server mode on port 6379",
+    "Docker and Docker Compose deployment support",
+    "Protocol-agnostic engine architecture"
+  ],
+  "publicApiSurface": [
+    "SET key value [EX seconds]",
+    "GET key",
+    "DEL key",
+    "TTL key",
+    "COUNT",
+    "SAVE file",
+    "LOAD file",
+    "BENCH n",
+    "INFO",
+    "HELP",
+    "EXIT",
+    "execute_command(HashTable *ht, char *line)",
+    "ht_create(int size)",
+    "ht_set(HashTable *ht, const char *key, const char *value, time_t expires_at)",
+    "ht_get(HashTable *ht, const char *key)",
+    "ht_delete(HashTable *ht, const char *key)",
+    "ht_ttl(HashTable *ht, const char *key)",
+    "ht_info(HashTable *ht)",
+    "aof_open(const char *filename)",
+    "aof_append_set(const char *key, const char *value, const char *expire_at)",
+    "aof_append_del(const char *key)",
+    "aof_replay(HashTable *h, const char *filename)",
+    "aof_rewrite(HashTable *ht, const char *filename)",
+    "ht_save(HashTable *ht, const char *filename)",
+    "ht_load(HashTable **ht, const char *filename)",
+    "expire_init(HashTable *ht)",
+    "expire_sweep(HashTable *ht, size_t max_checks)",
+    "start_server(HashTable *ht)"
+  ]
+}
